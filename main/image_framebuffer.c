@@ -118,12 +118,12 @@ bool image_framebuffer_parse_input_packet(const char *packet, image_input_state_
     memcpy(packet_copy, packet, packet_len);
     packet_copy[packet_len] = '\0';
 
-    int fields[5] = {0, 0, 0, 0, 0};
+    int fields[6] = {0, 0, 0, 0, 0, 0};
     size_t field_count = 0U;
 
     char *save_ptr = NULL;
     char *token = strtok_r(packet_copy + 3, ",", &save_ptr);
-    while (token != NULL && field_count < 5U) {
+    while (token != NULL && field_count < 6U) {
         if (!image_framebuffer_parse_int_token(token, &fields[field_count])) {
             return false;
         }
@@ -132,7 +132,7 @@ bool image_framebuffer_parse_input_packet(const char *packet, image_input_state_
     }
 
     if (token != NULL) {
-        // More than 5 comma-separated values is invalid.
+        // More than 6 comma-separated values is invalid.
         return false;
     }
 
@@ -140,6 +140,7 @@ bool image_framebuffer_parse_input_packet(const char *packet, image_input_state_
     // $S,x,y,pen
     // $S,x,y,pen,erase
     // $S,x,y,pen,erase,submit
+    // $S,x,y,pen,erase,submit,promptRequest
     if (field_count < 3U) {
         return false;
     }
@@ -149,11 +150,15 @@ bool image_framebuffer_parse_input_packet(const char *packet, image_input_state_
     const int pen_down = fields[2];
     const int erase = (field_count >= 4U) ? fields[3] : 0;
     const int submit = (field_count >= 5U) ? fields[4] : 0;
+    const int prompt_request = (field_count >= 6U) ? fields[5] : 0;
 
     if (x < 0 || x >= IMAGE_FRAMEBUFFER_CANVAS_WIDTH || y < 0 || y >= IMAGE_FRAMEBUFFER_CANVAS_HEIGHT) {
         return false;
     }
-    if ((pen_down != 0 && pen_down != 1) || (erase != 0 && erase != 1) || (submit != 0 && submit != 1)) {
+    if ((pen_down != 0 && pen_down != 1) ||
+        (erase != 0 && erase != 1) ||
+        (submit != 0 && submit != 1) ||
+        (prompt_request != 0 && prompt_request != 1)) {
         return false;
     }
 
@@ -162,6 +167,7 @@ bool image_framebuffer_parse_input_packet(const char *packet, image_input_state_
     out_state->pen_down = (pen_down == 1);
     out_state->erase = (erase == 1);
     out_state->submit = (submit == 1);
+    out_state->prompt_request = (prompt_request == 1);
     return true;
 }
 

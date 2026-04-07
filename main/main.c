@@ -7,14 +7,11 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <ctype.h>
 
+#include "app_api.h"
 #include "driver/uart.h"
-#include "cJSON.h"
-#include "esp_crt_bundle.h"
 #include "esp_err.h"
 #include "esp_event.h"
-#include "esp_http_client.h"
 #include "esp_http_server.h"
 #include "esp_log.h"
 #include "esp_netif.h"
@@ -35,18 +32,16 @@
 // On ESP32-S2 DevKit boards, GPIO18 is commonly wired to the onboard RGB LED.
 // Keep UART RX on a dedicated pin to avoid contention with LED activity.
 #define UART_RX_PIN 16
-#define UART_RX_BUFFER_SIZE 512
+#define UART_RX_BUFFER_SIZE 2048
 #define UART_PACKET_BUFFER_SIZE 64
 #define UART_READ_TIMEOUT_MS 100
 #define VIEWER_STROKE_PAYLOAD_BUFFER_SIZE 160
 #define APP_WS_ENDPOINT_URI "/ws"
 #define APP_WS_SUBPROTOCOL "etchsketch.v1.json"
 #define APP_WIFI_CONNECTED_BIT BIT0
-#define APP_HTTP_RESPONSE_BUFFER_SIZE 8192
-#define APP_AI_CONTENT_BUFFER_SIZE 768
-#define APP_PROMPT_WORD_BUFFER_SIZE 64
-#define APP_AI_GUESS_BUFFER_SIZE 64
 #define APP_MCU_CONTROL_PACKET_BUFFER_SIZE 48
+#define APP_MCU_RESULT_COMMAND "RESULT"
+#define APP_MCU_PROMPT_READY_COMMAND "PROMPT"
 
 enum {
     APP_WS_MAX_OPEN_SOCKETS = 4,
@@ -57,7 +52,7 @@ enum {
 };
 
 enum {
-    APP_RTOS_UART_PACKET_QUEUE_LENGTH = 16,
+    APP_RTOS_UART_PACKET_QUEUE_LENGTH = 64,
     APP_RTOS_FRAMEBUFFER_STATE_QUEUE_LENGTH = 64,
     APP_RTOS_UART_RX_TASK_STACK_SIZE = 4096,
     APP_RTOS_SOCKET_DISPATCH_TASK_STACK_SIZE = 8192,
@@ -80,12 +75,12 @@ static const app_rtos_config_t APP_RTOS_CONFIG = {
     .uart_rx_task_name = "uart_rx_task",
     .socket_dispatch_task_name = "socket_dispatch_task",
     .framebuffer_task_name = "framebuffer_task",
-    .uart_queue_send_timeout_ms = 20U,
+    .uart_queue_send_timeout_ms = 0U,
     .framebuffer_queue_send_timeout_ms = 0U,
     .stack_watermark_log_period_ms = 5000U,
     .uart_rx_task_priority = 5,
-    .socket_dispatch_task_priority = 4,
-    .framebuffer_task_priority = 3,
+    .socket_dispatch_task_priority = 6,
+    .framebuffer_task_priority = 4,
 };
 
 static const char *TAG = "image_framebuffer";
@@ -104,7 +99,14 @@ typedef struct {
     char packet_line[UART_PACKET_BUFFER_SIZE];
 } uart_packet_msg_t;
 
+typedef enum {
+    FRAMEBUFFER_EVENT_APPLY_STATE = 0,
+    FRAMEBUFFER_EVENT_SUBMIT = 1,
+    FRAMEBUFFER_EVENT_PROMPT_REQUEST = 2,
+} framebuffer_event_type_t;
+
 typedef struct {
+    framebuffer_event_type_t type;
     image_input_state_t state;
 } framebuffer_state_msg_t;
 
@@ -131,284 +133,12 @@ static uint32_t s_uart_queue_drop_count;
 static uint32_t s_framebuffer_queue_drop_count;
 static uint32_t s_uart_parse_ok_count;
 static uint32_t s_uart_parse_fail_count;
+// Temporary integration flag until teammate-owned API layer is connected.
+static bool s_submit_stub_success_flag = true;
 
 static esp_err_t app_socket_send_frame(const char *payload, size_t payload_len);
 
-typedef struct {
-    char *buffer;
-    size_t capacity;
-    size_t length;
-} app_http_response_buffer_t;
-
-typedef struct {
-    char guess[APP_AI_GUESS_BUFFER_SIZE];
-    int confidence;
-    bool correct;
-} app_ai_submit_result_t;
-
-static char s_active_prompt_word[APP_PROMPT_WORD_BUFFER_SIZE] = "house";
-
-static bool app_is_api_key_configured(void)
-{
-    return (OPENAI_API_KEY[0] != '\0') && (strcmp(OPENAI_API_KEY, "YOUR_OPENAI_API_KEY") != 0);
-}
-
-static esp_err_t app_http_event_handler(esp_http_client_event_t *evt)
-{
-    if (evt == NULL) {
-        return ESP_ERR_INVALID_ARG;
-    }
-
-    app_http_response_buffer_t *response = (app_http_response_buffer_t *)evt->user_data;
-    if (response == NULL) {
-        return ESP_OK;
-    }
-
-    if (evt->event_id == HTTP_EVENT_ON_DATA && evt->data != NULL && evt->data_len > 0) {
-        if (response->length >= response->capacity) {
-            return ESP_OK;
-        }
-
-        const size_t available = response->capacity - response->length - 1U;
-        if (available == 0U) {
-            return ESP_OK;
-        }
-
-        const size_t copy_len = (evt->data_len < (int)available) ? (size_t)evt->data_len : available;
-        memcpy(response->buffer + response->length, evt->data, copy_len);
-        response->length += copy_len;
-        response->buffer[response->length] = '\0';
-    }
-
-    return ESP_OK;
-}
-
-static esp_err_t app_http_post_json(const char *url,
-                                    const char *body,
-                                    char *out_response,
-                                    size_t out_response_len)
-{
-    if (url == NULL || body == NULL || out_response == NULL || out_response_len < 2U) {
-        return ESP_ERR_INVALID_ARG;
-    }
-
-    out_response[0] = '\0';
-    app_http_response_buffer_t response = {
-        .buffer = out_response,
-        .capacity = out_response_len,
-        .length = 0U,
-    };
-
-    char auth_header[160];
-    const int auth_written = snprintf(auth_header, sizeof(auth_header), "Bearer %s", OPENAI_API_KEY);
-    if (auth_written <= 0 || (size_t)auth_written >= sizeof(auth_header)) {
-        return ESP_ERR_INVALID_SIZE;
-    }
-
-    esp_http_client_config_t config = {
-        .url = url,
-        .event_handler = app_http_event_handler,
-        .user_data = &response,
-        .transport_type = HTTP_TRANSPORT_OVER_SSL,
-        .crt_bundle_attach = esp_crt_bundle_attach,
-        .method = HTTP_METHOD_POST,
-    };
-
-    esp_http_client_handle_t client = esp_http_client_init(&config);
-    if (client == NULL) {
-        return ESP_ERR_NO_MEM;
-    }
-
-    esp_http_client_set_header(client, "Content-Type", "application/json");
-    esp_http_client_set_header(client, "Authorization", auth_header);
-    esp_http_client_set_post_field(client, body, strlen(body));
-
-    const esp_err_t err = esp_http_client_perform(client);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "HTTP POST failed: %s", esp_err_to_name(err));
-    }
-
-    esp_http_client_cleanup(client);
-    return err;
-}
-
-static bool app_extract_chat_content(const char *response_json,
-                                     char *out_content,
-                                     size_t out_content_len)
-{
-    if (response_json == NULL || out_content == NULL || out_content_len == 0U) {
-        return false;
-    }
-
-    cJSON *root = cJSON_Parse(response_json);
-    if (root == NULL) {
-        return false;
-    }
-
-    const cJSON *choices = cJSON_GetObjectItemCaseSensitive(root, "choices");
-    const cJSON *choice0 = cJSON_IsArray(choices) ? cJSON_GetArrayItem(choices, 0) : NULL;
-    const cJSON *message = cJSON_IsObject(choice0) ? cJSON_GetObjectItemCaseSensitive(choice0, "message") : NULL;
-    const cJSON *content = cJSON_IsObject(message) ? cJSON_GetObjectItemCaseSensitive(message, "content") : NULL;
-
-    bool ok = false;
-    if (cJSON_IsString(content) && content->valuestring != NULL) {
-        const size_t content_len = strnlen(content->valuestring, out_content_len - 1U);
-        memcpy(out_content, content->valuestring, content_len);
-        out_content[content_len] = '\0';
-        ok = true;
-    }
-
-    cJSON_Delete(root);
-    return ok;
-}
-
-static void app_sanitize_token(const char *input, char *output, size_t output_len)
-{
-    if (output == NULL || output_len == 0U) {
-        return;
-    }
-
-    output[0] = '\0';
-    if (input == NULL) {
-        return;
-    }
-
-    size_t in_idx = 0U;
-    while (input[in_idx] != '\0' && !isalnum((unsigned char)input[in_idx])) {
-        in_idx++;
-    }
-
-    size_t out_idx = 0U;
-    while (input[in_idx] != '\0' && out_idx + 1U < output_len) {
-        const char ch = input[in_idx];
-        if (!(isalnum((unsigned char)ch) || ch == '-' || ch == '_' || ch == ' ')) {
-            break;
-        }
-        output[out_idx++] = ch;
-        in_idx++;
-    }
-    output[out_idx] = '\0';
-}
-
-static bool app_try_extract_prompt_word(const char *content,
-                                        char *out_word,
-                                        size_t out_word_len)
-{
-    if (content == NULL || out_word == NULL || out_word_len < 2U) {
-        return false;
-    }
-
-    cJSON *content_json = cJSON_Parse(content);
-    if (content_json != NULL) {
-        const cJSON *word = cJSON_GetObjectItemCaseSensitive(content_json, "word");
-        if (cJSON_IsString(word) && word->valuestring != NULL) {
-            app_sanitize_token(word->valuestring, out_word, out_word_len);
-            cJSON_Delete(content_json);
-            return out_word[0] != '\0';
-        }
-        cJSON_Delete(content_json);
-    }
-
-    app_sanitize_token(content, out_word, out_word_len);
-    return out_word[0] != '\0';
-}
-
-static bool app_words_equal_ignore_case(const char *lhs, const char *rhs)
-{
-    if (lhs == NULL || rhs == NULL) {
-        return false;
-    }
-
-    size_t li = 0U;
-    size_t ri = 0U;
-    while (lhs[li] != '\0' && rhs[ri] != '\0') {
-        while (lhs[li] == ' ') {
-            li++;
-        }
-        while (rhs[ri] == ' ') {
-            ri++;
-        }
-
-        const char lc = (char)tolower((unsigned char)lhs[li]);
-        const char rc = (char)tolower((unsigned char)rhs[ri]);
-        if (lc != rc) {
-            return false;
-        }
-        if (lhs[li] == '\0') {
-            break;
-        }
-
-        li++;
-        ri++;
-    }
-
-    while (lhs[li] == ' ') {
-        li++;
-    }
-    while (rhs[ri] == ' ') {
-        ri++;
-    }
-
-    return lhs[li] == '\0' && rhs[ri] == '\0';
-}
-
-static void app_parse_submit_result(const char *content,
-                                    const char *target_word,
-                                    app_ai_submit_result_t *out_result)
-{
-    if (out_result == NULL) {
-        return;
-    }
-
-    out_result->guess[0] = '\0';
-    out_result->confidence = 1;
-    out_result->correct = false;
-
-    if (content == NULL) {
-        strncpy(out_result->guess, "unknown", sizeof(out_result->guess) - 1U);
-        out_result->guess[sizeof(out_result->guess) - 1U] = '\0';
-        return;
-    }
-
-    cJSON *content_json = cJSON_Parse(content);
-    if (content_json != NULL) {
-        const cJSON *guess = cJSON_GetObjectItemCaseSensitive(content_json, "guess");
-        const cJSON *confidence = cJSON_GetObjectItemCaseSensitive(content_json, "confidence");
-        const cJSON *correct = cJSON_GetObjectItemCaseSensitive(content_json, "correct");
-
-        if (cJSON_IsString(guess) && guess->valuestring != NULL) {
-            app_sanitize_token(guess->valuestring, out_result->guess, sizeof(out_result->guess));
-        }
-
-        if (cJSON_IsNumber(confidence)) {
-            out_result->confidence = confidence->valueint;
-        }
-
-        if (cJSON_IsBool(correct)) {
-            out_result->correct = cJSON_IsTrue(correct);
-        }
-
-        cJSON_Delete(content_json);
-    } else {
-        app_sanitize_token(content, out_result->guess, sizeof(out_result->guess));
-    }
-
-    if (out_result->guess[0] == '\0') {
-        strncpy(out_result->guess, "unknown", sizeof(out_result->guess) - 1U);
-        out_result->guess[sizeof(out_result->guess) - 1U] = '\0';
-    }
-
-    if (out_result->confidence < 1) {
-        out_result->confidence = 1;
-    }
-    if (out_result->confidence > 10) {
-        out_result->confidence = 10;
-    }
-
-    if (target_word != NULL && target_word[0] != '\0') {
-        out_result->correct = out_result->correct || app_words_equal_ignore_case(out_result->guess, target_word);
-    }
-}
+static char s_active_prompt_word[APP_API_PROMPT_WORD_BUFFER_SIZE] = "house";
 
 static esp_err_t app_send_mcu_command(const char *command, int value)
 {
@@ -428,6 +158,16 @@ static esp_err_t app_send_mcu_command(const char *command, int value)
     }
 
     return ESP_OK;
+}
+
+static esp_err_t app_send_mcu_submit_result(bool submit_success)
+{
+    return app_send_mcu_command(APP_MCU_RESULT_COMMAND, submit_success ? 1 : 0);
+}
+
+static esp_err_t app_send_mcu_prompt_ready(void)
+{
+    return app_send_mcu_command(APP_MCU_PROMPT_READY_COMMAND, 1);
 }
 
 static void app_emit_submit_result(const app_ai_submit_result_t *result)
@@ -450,90 +190,10 @@ static void app_emit_submit_result(const app_ai_submit_result_t *result)
         }
     }
 
-    int rating = (result->confidence + 1) / 2;
-    if (rating < 1) {
-        rating = 1;
+    const esp_err_t result_err = app_send_mcu_submit_result(result->correct);
+    if (result_err != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to send RESULT command to MCU: %s", esp_err_to_name(result_err));
     }
-    if (rating > 5) {
-        rating = 5;
-    }
-
-    const esp_err_t rate_err = app_send_mcu_command("RATE", rating);
-    if (rate_err != ESP_OK) {
-        ESP_LOGW(TAG, "Failed to send RATE command to MCU: %s", esp_err_to_name(rate_err));
-    }
-
-    const esp_err_t done_err = app_send_mcu_command("DONE", 1);
-    if (done_err != ESP_OK) {
-        ESP_LOGW(TAG, "Failed to send DONE command to MCU: %s", esp_err_to_name(done_err));
-    }
-}
-
-static esp_err_t app_fetch_and_publish_prompt(void)
-{
-    if (!app_is_api_key_configured()) {
-        ESP_LOGW(TAG, "OPENAI_API_KEY is not configured; using default prompt '%s'", s_active_prompt_word);
-    } else {
-        cJSON *root = cJSON_CreateObject();
-        cJSON *messages = cJSON_CreateArray();
-        cJSON *message = cJSON_CreateObject();
-        if (root == NULL || messages == NULL || message == NULL) {
-            cJSON_Delete(root);
-            cJSON_Delete(messages);
-            cJSON_Delete(message);
-            return ESP_ERR_NO_MEM;
-        }
-
-        cJSON_AddStringToObject(root, "model", "gpt-4o-mini");
-        cJSON_AddStringToObject(message, "role", "user");
-        cJSON_AddStringToObject(message,
-                                "content",
-                                "Give me one simple Pictionary noun. Respond ONLY with JSON: {\"word\":\"<noun>\"}");
-        cJSON_AddItemToArray(messages, message);
-        cJSON_AddItemToObject(root, "messages", messages);
-
-        char *request_body = cJSON_PrintUnformatted(root);
-        cJSON_Delete(root);
-        if (request_body == NULL) {
-            return ESP_ERR_NO_MEM;
-        }
-
-        char http_response[APP_HTTP_RESPONSE_BUFFER_SIZE];
-        const esp_err_t prompt_err = app_http_post_json("https://api.openai.com/v1/chat/completions",
-                                                        request_body,
-                                                        http_response,
-                                                        sizeof(http_response));
-        free(request_body);
-        if (prompt_err == ESP_OK) {
-            char content[APP_AI_CONTENT_BUFFER_SIZE];
-            if (app_extract_chat_content(http_response, content, sizeof(content))) {
-                char prompt_word[APP_PROMPT_WORD_BUFFER_SIZE];
-                if (app_try_extract_prompt_word(content, prompt_word, sizeof(prompt_word))) {
-                    strncpy(s_active_prompt_word, prompt_word, sizeof(s_active_prompt_word) - 1U);
-                    s_active_prompt_word[sizeof(s_active_prompt_word) - 1U] = '\0';
-                }
-            }
-        } else {
-            ESP_LOGW(TAG, "Prompt fetch failed: %s", esp_err_to_name(prompt_err));
-        }
-    }
-
-    char prompt_json[128];
-    const int prompt_written = snprintf(prompt_json,
-                                        sizeof(prompt_json),
-                                        "{\"type\":\"prompt\",\"word\":\"%s\"}",
-                                        s_active_prompt_word);
-    if (prompt_written <= 0 || (size_t)prompt_written >= sizeof(prompt_json)) {
-        return ESP_ERR_INVALID_SIZE;
-    }
-
-    const esp_err_t ws_err = app_socket_send_frame(prompt_json, (size_t)prompt_written);
-    if (ws_err != ESP_OK) {
-        ESP_LOGW(TAG, "Prompt websocket send failed: %s", esp_err_to_name(ws_err));
-    }
-
-    ESP_LOGI(TAG, "Active prompt word: %s", s_active_prompt_word);
-    return ESP_OK;
 }
 
 static esp_err_t app_nvs_init(void)
@@ -850,6 +510,7 @@ static void app_log_uart_input_if_changed(const image_input_state_t *state)
 {
     static image_input_state_t last_state;
     static bool has_last_state;
+    static TickType_t last_input_log_tick;
 
     if (state == NULL) {
         return;
@@ -860,18 +521,29 @@ static void app_log_uart_input_if_changed(const image_input_state_t *state)
                          state->y != last_state.y ||
                          state->pen_down != last_state.pen_down ||
                          state->erase != last_state.erase ||
-                         state->submit != last_state.submit;
+                         state->submit != last_state.submit ||
+                         state->prompt_request != last_state.prompt_request;
     if (!changed) {
         return;
     }
 
+    const TickType_t now = xTaskGetTickCount();
+    const TickType_t log_period_ticks = pdMS_TO_TICKS(100);
+    if (last_input_log_tick != 0 && (now - last_input_log_tick) < log_period_ticks) {
+        last_state = *state;
+        has_last_state = true;
+        return;
+    }
+    last_input_log_tick = now;
+
     ESP_LOGI(TAG,
-             "UART input: x=%u y=%u penDown=%u erase=%u submit=%u",
+             "UART input: x=%u y=%u penDown=%u erase=%u submit=%u promptReq=%u",
              (unsigned)state->x,
              (unsigned)state->y,
              state->pen_down ? 1U : 0U,
              state->erase ? 1U : 0U,
-             state->submit ? 1U : 0U);
+             state->submit ? 1U : 0U,
+             state->prompt_request ? 1U : 0U);
 
     last_state = *state;
     has_last_state = true;
@@ -1054,95 +726,6 @@ static esp_err_t app_socket_send_frame(const char *payload, size_t payload_len)
 #endif
 }
 
-static esp_err_t app_api_submit_drawing(const char *payload, size_t payload_len)
-{
-    if (payload == NULL || payload_len == 0U) {
-        return ESP_ERR_INVALID_ARG;
-    }
-
-    app_ai_submit_result_t result = {
-        .guess = "unknown",
-        .confidence = 1,
-        .correct = false,
-    };
-
-    if (!app_is_api_key_configured()) {
-        ESP_LOGW(TAG, "OPENAI_API_KEY is not configured; publishing fallback submit result");
-        app_emit_submit_result(&result);
-        return ESP_OK;
-    }
-
-    const size_t instruction_len = payload_len + 768U;
-    char *instruction = malloc(instruction_len);
-    if (instruction == NULL) {
-        return ESP_ERR_NO_MEM;
-    }
-
-    const int instruction_written = snprintf(
-        instruction,
-        instruction_len,
-        "You are judging a 128x128 monochrome Etch-a-Sketch drawing. "
-        "The target word is '%s'. "
-        "The drawing payload is JSON in this message with fields: type,width,height,format,data, where data is base64 1bpp-msb framebuffer. "
-        "Drawing payload: %.*s "
-        "Return ONLY JSON exactly in this shape: {\"guess\":\"<word>\",\"confidence\":<1-10>,\"correct\":<true|false>}.",
-        s_active_prompt_word,
-        (int)payload_len,
-        payload);
-    if (instruction_written <= 0 || (size_t)instruction_written >= instruction_len) {
-        free(instruction);
-        return ESP_ERR_INVALID_SIZE;
-    }
-
-    cJSON *root = cJSON_CreateObject();
-    cJSON *messages = cJSON_CreateArray();
-    cJSON *message = cJSON_CreateObject();
-    if (root == NULL || messages == NULL || message == NULL) {
-        free(instruction);
-        cJSON_Delete(root);
-        cJSON_Delete(messages);
-        cJSON_Delete(message);
-        return ESP_ERR_NO_MEM;
-    }
-
-    cJSON_AddStringToObject(root, "model", "gpt-4o-mini");
-    cJSON_AddStringToObject(message, "role", "user");
-    cJSON_AddStringToObject(message, "content", instruction);
-    cJSON_AddItemToArray(messages, message);
-    cJSON_AddItemToObject(root, "messages", messages);
-    free(instruction);
-
-    char *request_body = cJSON_PrintUnformatted(root);
-    cJSON_Delete(root);
-    if (request_body == NULL) {
-        return ESP_ERR_NO_MEM;
-    }
-
-    char http_response[APP_HTTP_RESPONSE_BUFFER_SIZE];
-    const esp_err_t http_err = app_http_post_json("https://api.openai.com/v1/chat/completions",
-                                                  request_body,
-                                                  http_response,
-                                                  sizeof(http_response));
-    free(request_body);
-    if (http_err != ESP_OK) {
-        return http_err;
-    }
-
-    char content[APP_AI_CONTENT_BUFFER_SIZE];
-    if (!app_extract_chat_content(http_response, content, sizeof(content))) {
-        return ESP_FAIL;
-    }
-
-    app_parse_submit_result(content, s_active_prompt_word, &result);
-    app_emit_submit_result(&result);
-    ESP_LOGI(TAG,
-             "Submit result: guess='%s', confidence=%d, correct=%u",
-             result.guess,
-             result.confidence,
-             result.correct ? 1U : 0U);
-    return ESP_OK;
-}
-
 static size_t app_build_viewer_stroke_payload(const image_input_state_t *state,
                                               char *out_json,
                                               size_t out_json_len)
@@ -1188,27 +771,85 @@ static void app_submit_drawing_for_ai(char *socket_payload, size_t socket_payloa
         return;
     }
 
-    const esp_err_t err = app_api_submit_drawing(socket_payload, payload_len);
+    app_ai_submit_result_t result = {
+        .guess = "unknown",
+        .confidence = 1,
+        .correct = false,
+    };
+    bool submit_success = false;
+
+    const esp_err_t err = app_api_submit_drawing(socket_payload,
+                                                 payload_len,
+                                                 &result,
+                                                 &submit_success,
+                                                 s_submit_stub_success_flag);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "AI submit failed: %s", esp_err_to_name(err));
         return;
     }
 
-    // Pull the next round prompt after a successful submit.
-    const esp_err_t prompt_err = app_fetch_and_publish_prompt();
-    if (prompt_err != ESP_OK) {
-        ESP_LOGW(TAG, "Prompt refresh after submit failed: %s", esp_err_to_name(prompt_err));
+    app_emit_submit_result(&result);
+    ESP_LOGI(TAG,
+             "Submit result: guess='%s', confidence=%d, correct=%u (stubSuccess=%u)",
+             result.guess,
+             result.confidence,
+             result.correct ? 1U : 0U,
+             submit_success ? 1U : 0U);
+
+    if (!submit_success) {
+        ESP_LOGW(TAG, "Submit processing failed; waiting for next explicit prompt request");
     }
 }
 
 static void app_enqueue_framebuffer_state(const image_input_state_t *state)
 {
-    if (state == NULL || s_framebuffer_state_queue == NULL) {
+    if (state == NULL) {
         return;
     }
 
     framebuffer_state_msg_t msg = {
+        .type = FRAMEBUFFER_EVENT_APPLY_STATE,
         .state = *state,
+    };
+
+    if (s_framebuffer_state_queue == NULL) {
+        return;
+    }
+
+    const BaseType_t queued = xQueueSend(s_framebuffer_state_queue,
+                                         &msg,
+                                         pdMS_TO_TICKS(APP_RTOS_CONFIG.framebuffer_queue_send_timeout_ms));
+    if (queued != pdPASS) {
+        s_framebuffer_queue_drop_count++;
+    }
+}
+
+static void app_enqueue_submit_event(void)
+{
+    if (s_framebuffer_state_queue == NULL) {
+        return;
+    }
+
+    framebuffer_state_msg_t msg = {
+        .type = FRAMEBUFFER_EVENT_SUBMIT,
+    };
+
+    const BaseType_t queued = xQueueSend(s_framebuffer_state_queue,
+                                         &msg,
+                                         pdMS_TO_TICKS(APP_RTOS_CONFIG.framebuffer_queue_send_timeout_ms));
+    if (queued != pdPASS) {
+        s_framebuffer_queue_drop_count++;
+    }
+}
+
+static void app_enqueue_prompt_request_event(void)
+{
+    if (s_framebuffer_state_queue == NULL) {
+        return;
+    }
+
+    framebuffer_state_msg_t msg = {
+        .type = FRAMEBUFFER_EVENT_PROMPT_REQUEST,
     };
 
     const BaseType_t queued = xQueueSend(s_framebuffer_state_queue,
@@ -1222,6 +863,8 @@ static void app_enqueue_framebuffer_state(const image_input_state_t *state)
 static void app_process_packet_line_fast_path(const char *packet_line)
 {
     static TickType_t last_malformed_log_tick;
+    static bool s_submit_level_high;
+    static bool s_prompt_request_level_high;
 
     image_input_state_t state;
     if (!image_framebuffer_parse_input_packet(packet_line, &state)) {
@@ -1239,26 +882,67 @@ static void app_process_packet_line_fast_path(const char *packet_line)
     // Fast path: publish raw pen movement to the browser immediately.
     app_send_viewer_stroke_update(&state);
 
+    const bool submit_rising_edge = state.submit && !s_submit_level_high;
+    s_submit_level_high = state.submit;
+
+    const bool prompt_request_rising_edge = state.prompt_request && !s_prompt_request_level_high;
+    s_prompt_request_level_high = state.prompt_request;
+
     // Slow path: build authoritative framebuffer state in a lower-priority worker.
     app_enqueue_framebuffer_state(&state);
+
+    // Command path: enqueue explicit submit event on rising edge only.
+    if (submit_rising_edge) {
+        app_enqueue_submit_event();
+    }
+
+    if (prompt_request_rising_edge) {
+        app_enqueue_prompt_request_event();
+    }
 }
 
-static void app_process_framebuffer_state(const image_input_state_t *state,
-                                          char *socket_payload,
-                                          size_t socket_payload_len)
+static void app_process_framebuffer_state(const image_input_state_t *state)
 {
     if (state == NULL) {
         return;
     }
 
     image_framebuffer_apply_input(&s_framebuffer, state);
+}
 
-    if (!state->submit) {
+static void app_process_framebuffer_event(const framebuffer_state_msg_t *msg,
+                                          char *socket_payload,
+                                          size_t socket_payload_len)
+{
+    if (msg == NULL) {
         return;
     }
 
-    // Submit is reserved for the AI guess pipeline.
-    app_submit_drawing_for_ai(socket_payload, socket_payload_len);
+    if (msg->type == FRAMEBUFFER_EVENT_APPLY_STATE) {
+        app_process_framebuffer_state(&msg->state);
+        return;
+    }
+
+    if (msg->type == FRAMEBUFFER_EVENT_SUBMIT) {
+        // Submit is reserved for the AI guess pipeline.
+        app_submit_drawing_for_ai(socket_payload, socket_payload_len);
+        return;
+    }
+
+    if (msg->type == FRAMEBUFFER_EVENT_PROMPT_REQUEST) {
+        const esp_err_t prompt_err = app_api_fetch_and_publish_prompt(app_socket_send_frame,
+                                                                       s_active_prompt_word,
+                                                                       sizeof(s_active_prompt_word));
+        if (prompt_err != ESP_OK) {
+            ESP_LOGW(TAG, "Prompt request failed: %s", esp_err_to_name(prompt_err));
+            return;
+        }
+
+        const esp_err_t notify_err = app_send_mcu_prompt_ready();
+        if (notify_err != ESP_OK) {
+            ESP_LOGW(TAG, "Failed to send PROMPT ready command to MCU: %s", esp_err_to_name(notify_err));
+        }
+    }
 }
 
 static void app_uart_rx_task(void *arg)
@@ -1324,7 +1008,7 @@ static void app_framebuffer_task(void *arg)
     while (true) {
         const BaseType_t received = xQueueReceive(s_framebuffer_state_queue, &msg, portMAX_DELAY);
         if (received == pdPASS) {
-            app_process_framebuffer_state(&msg.state, socket_payload, SOCKET_PAYLOAD_BUFFER_SIZE);
+            app_process_framebuffer_event(&msg, socket_payload, SOCKET_PAYLOAD_BUFFER_SIZE);
         }
     }
 }
@@ -1433,8 +1117,15 @@ void app_main(void)
              APP_RTOS_CONFIG.socket_dispatch_task_name,
              APP_RTOS_CONFIG.framebuffer_task_name);
 
-    const esp_err_t prompt_init_err = app_fetch_and_publish_prompt();
+    const esp_err_t prompt_init_err = app_api_fetch_and_publish_prompt(app_socket_send_frame,
+                                                                       s_active_prompt_word,
+                                                                       sizeof(s_active_prompt_word));
     if (prompt_init_err != ESP_OK) {
         ESP_LOGW(TAG, "Initial prompt fetch/publish failed: %s", esp_err_to_name(prompt_init_err));
+    } else {
+        const esp_err_t notify_err = app_send_mcu_prompt_ready();
+        if (notify_err != ESP_OK) {
+            ESP_LOGW(TAG, "Initial PROMPT ready command failed: %s", esp_err_to_name(notify_err));
+        }
     }
 }

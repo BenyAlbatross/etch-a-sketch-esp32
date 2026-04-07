@@ -13,7 +13,7 @@
   "clangd.arguments": [
     "--background-index",
     "--query-driver=**",
-    "--compile-commands-dir=build"
+    "--compile-commands-dir=/Users/benjamin/Documents/CodingProjects/etch-a-sketch-main/etch-a-sketch-esp32/build"
   ],
   "idf.flashType": "UART"
 }

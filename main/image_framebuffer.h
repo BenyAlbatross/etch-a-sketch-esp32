@@ -17,6 +17,7 @@ typedef struct {
     bool pen_down;
     bool erase;
     bool submit;
+    bool prompt_request;
 } image_input_state_t;
 
 typedef struct {

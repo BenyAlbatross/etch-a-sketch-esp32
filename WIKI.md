@@ -262,7 +262,217 @@ Raised the MCXC-to-ESP32 UART link from 9600 baud to 115200 baud and reduced the
 - The WebSocket path already emits one stroke JSON per parsed UART packet, so increasing the UART producer cadence directly improves browser update cadence without changing the socket protocol.
 - The ESP32 and MCXC baud rates must match; changing only one side will break the UART link.
 
+## 2026-04-07 - UART Queue Saturation Mitigation
+
+Observed runtime warning under sustained drawing input:
+
+- `UART packet queue full, dropping packet`
+
+### What changed
+
+- Increased UART driver RX ring buffer from `512` to `2048` bytes.
+- Increased UART packet queue depth from `16` to `64` messages.
+- Changed task priorities so queue consumer preempts producer when backlog appears:
+	- `socket_dispatch_task`: `4 -> 6`
+	- `uart_rx_task`: remains `5`
+	- `framebuffer_task`: `3 -> 4`
+- Changed UART queue send timeout from `20 ms` to `0 ms` (non-blocking enqueue attempt) to avoid producer-side blocking stalls that can worsen UART RX overrun risk.
+- Throttled verbose `UART input` state-change logs to a max of 10 Hz to reduce avoidable CPU/log I/O overhead in the consumer path.
+
+### Software engineering rationale
+
+- The queue-full symptom indicates sustained producer throughput exceeding consumer throughput.
+- With producer priority above consumer, backlogs can self-amplify under bursty/high-rate input.
+- Prioritizing the consumer and adding bounded buffering is a standard producer-consumer stabilization pattern in RTOS systems.
+- Reducing log pressure in hot paths removes non-functional work that can hide as latency under real-time input.
+
+### References (ESP-IDF / FreeRTOS docs)
+
+- ESP-IDF FreeRTOS task scheduling and priorities:
+	- https://docs.espressif.com/projects/esp-idf/en/stable/esp32s2/api-reference/system/freertos_idf.html
+
+- ESP-IDF FreeRTOS queues (`xQueueSend`, `xQueueReceive`, timeouts):
+	- https://docs.espressif.com/projects/esp-idf/en/stable/esp32s2/api-reference/system/freertos_idf.html
+
 ## Backlog TODO
 
 - [x] Add runtime stack watermark logs for both tasks to tune stack sizes safely.
 - [x] Convert task/queue names and constants into a small RTOS config block to make future review easier.
+
+## 2026-04-07 - Submission Stub + MCU RESULT Protocol (Increment 1)
+
+Started methodical implementation for submit/receive decoupling from teammate-owned API integration.
+
+### What changed
+
+- Introduced a temporary submit stub path in `main/main.c`:
+	- `app_submit_stub_request_result(...)`
+	- Controlled by a single flag: `s_submit_stub_success_flag` (true/false)
+- Changed submit pipeline wiring so `app_submit_drawing_for_ai(...)` now:
+	- requests a stubbed submit result
+	- always emits browser result JSON (`guess`, `confidence`, `correct`)
+	- refreshes next prompt only when submit success is true
+- Updated MCXC command behavior for submit outcomes:
+	- replaced confidence-derived `RATE` + `DONE` sends
+	- now sends only `$C,RESULT,<0|1>\n` using a dedicated helper
+
+### Software engineering rationale
+
+- This isolates integration risk by keeping submit trigger and transport flow intact while replacing only the API dependency edge.
+- A single boolean stub flag enables deterministic success/failure path testing without network dependence.
+- Browser schema stability is preserved, so frontend work can continue unchanged while backend integration is pending.
+- MCXC now receives only success/failure, matching updated actuator ownership (green/red LED decision on MCXC side).
+
+### Team boundary / handoff
+
+- Teammate-owned work should replace the body of `app_api_submit_drawing(...)` while preserving the function contract expected by the submit pipeline.
+- Do not re-introduce `RATE`/`DONE` in this path unless protocol ownership changes again.
+
+### RTOS note
+
+- No new RTOS primitives were introduced in this increment.
+- Existing task/queue topology remains unchanged (`uart_rx_task` -> `socket_dispatch_task` -> `framebuffer_task`).
+
+### References (ESP-IDF / FreeRTOS docs)
+
+- ESP-IDF FreeRTOS task and queue behavior:
+	- https://docs.espressif.com/projects/esp-idf/en/stable/esp32s2/api-reference/system/freertos_idf.html
+
+## 2026-04-07 - Submit Rising-Edge Latch (Increment 2)
+
+Added submit edge-detection to prevent repeated submissions when the MCU keeps `submit=1` across multiple UART state packets.
+
+### What changed
+
+- In `main/main.c`, `app_process_framebuffer_state(...)` now uses a local static submit-level latch:
+	- submission triggers only on `0 -> 1` transition
+	- while `submit` stays high, additional packets do not retrigger API submit
+	- latch rearms when `submit` returns to `0`
+
+### Software engineering rationale
+
+- The UART producer can emit state at high cadence, so level-triggered submit causes duplicate submissions for a single button hold.
+- Rising-edge gating converts submit into a one-shot event per press without changing packet schema.
+- The latch is scoped to the framebuffer consumer path, which is already single-writer/single-consumer for authoritative state.
+
+### RTOS note
+
+- No new RTOS primitive was introduced.
+- The change is a task-local state machine within existing queue consumer execution.
+
+### Reference (ESP-IDF / FreeRTOS docs)
+
+- ESP-IDF FreeRTOS behavior (tasks/queues in ESP-IDF):
+	- https://docs.espressif.com/projects/esp-idf/en/stable/esp32s2/api-reference/system/freertos_idf.html
+
+## 2026-04-07 - Explicit Submit Event Channel (Increment 3)
+
+Refactored framebuffer queue payload to carry explicit event type so submit is represented as a command event rather than being handled inside state-apply logic.
+
+### What changed
+
+- `main/main.c` queue message now includes event type:
+	- `FRAMEBUFFER_EVENT_APPLY_STATE`
+	- `FRAMEBUFFER_EVENT_SUBMIT`
+- Fast path now creates events in order:
+	- enqueue apply-state event for every valid packet
+	- enqueue submit event only on submit rising edge (`0 -> 1`)
+- Framebuffer task now dispatches by event type:
+	- apply-state event -> mutate framebuffer
+	- submit event -> trigger AI submit pipeline
+
+### Software engineering rationale
+
+- Separates data-plane updates (strokes) from command-plane intent (submit).
+- Preserves deterministic ordering by using one queue and enqueue order.
+- Improves extensibility for future command events without changing state payload semantics.
+
+### RTOS note
+
+- Still uses existing producer/consumer tasks and queue primitives.
+- No additional tasks, mutexes, or synchronization primitives were introduced.
+
+### Reference (ESP-IDF / FreeRTOS docs)
+
+- ESP-IDF FreeRTOS tasks and queues:
+	- https://docs.espressif.com/projects/esp-idf/en/stable/esp32s2/api-reference/system/freertos_idf.html
+
+## 2026-04-07 - API Module Extraction + Stub Latency (Increment 4)
+
+Refactored API-related logic into dedicated files so teammate-owned API work can be edited without touching queue/task logic in `main/main.c`.
+
+### What changed
+
+- Added new API module files:
+	- `main/app_api.h`
+	- `main/app_api.c`
+- Moved prompt-fetch and prompt-publish API workflow into `app_api.c` via:
+	- `app_api_fetch_and_publish_prompt(...)`
+- Replaced in-file submit stub with module function:
+	- `app_api_submit_drawing(...)`
+- Added simulated API latency in submit stub:
+	- `vTaskDelay(pdMS_TO_TICKS(2000))`
+- Updated `main/main.c` to call module APIs and removed duplicated local HTTP/API helper functions.
+- Updated `main/CMakeLists.txt` to compile `app_api.c`.
+
+### Software engineering rationale
+
+- Isolates teammate-owned API integration surface from RTOS dataflow and queue-event orchestration.
+- Keeps compile-time contract explicit in `app_api.h`.
+- Stub latency provides realistic timing for integration tests involving queue pressure and UI responsiveness.
+
+### Team boundary / handoff
+
+- Teammate should modify only `main/app_api.c` implementations for real API calls.
+- `main/main.c` should remain focused on UART ingest, event routing, framebuffer mutation, and MCU/UI side effects.
+
+### RTOS note
+
+- Stub latency uses task delay (`vTaskDelay`) in the framebuffer consumer task context.
+- This intentionally simulates blocking submit latency while preserving task scheduling semantics.
+
+### References (ESP-IDF / FreeRTOS docs)
+
+- ESP-IDF FreeRTOS task API (`vTaskDelay`) and scheduling behavior:
+	- https://docs.espressif.com/projects/esp-idf/en/stable/esp32s2/api-reference/system/freertos_idf.html
+
+## 2026-04-07 - Prompt Request Handshake + Explicit Round Unlock (Increment 5)
+
+Implemented prompt-request signaling from MCU to ESP32 and explicit prompt-ready acknowledgment from ESP32 back to MCU.
+
+### What changed
+
+- Extended parsed MCU state packet schema in `main/image_framebuffer.*`:
+	- from: `$S,x,y,penDown,erase,submit`
+	- to:   `$S,x,y,penDown,erase,submit,promptRequest`
+	- parser remains backward compatible with 3/4/5-field variants.
+- Added new framebuffer event type in `main/main.c`:
+	- `FRAMEBUFFER_EVENT_PROMPT_REQUEST`
+- Added prompt request rising-edge latch in UART fast path:
+	- enqueues one prompt-request event per `0 -> 1` transition of `promptRequest`.
+- Added MCU prompt-ready command from ESP32:
+	- `$C,PROMPT,1\n`
+	- emitted after successful prompt fetch/publish.
+- Kept submit result command as:
+	- `$C,RESULT,<0|1>\n`
+- Removed automatic prompt refresh after submit:
+	- submit now only emits result
+	- next prompt is fetched only on explicit `promptRequest` event.
+
+### Software engineering rationale
+
+- Separates command intent into two explicit channels:
+	- `submit` -> evaluate current drawing
+	- `promptRequest` -> fetch next prompt and unlock next round
+- Keeps queue/event architecture extensible while maintaining strict ordering.
+- Rising-edge latches avoid repeated command execution when MCU holds a level high across multiple UART packets.
+
+### Protocol effect
+
+- MCU can now enforce strict lock/unlock semantics by waiting for `$C,PROMPT,1\n` before re-enabling drawing.
+- ESP32 no longer advances prompts implicitly after submit; round advancement becomes explicit and deterministic.
+
+### References (ESP-IDF / FreeRTOS docs)
+
+- ESP-IDF FreeRTOS tasks/queues in ESP-IDF:
+	- https://docs.espressif.com/projects/esp-idf/en/stable/esp32s2/api-reference/system/freertos_idf.html
