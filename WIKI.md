@@ -209,8 +209,60 @@ Validated in this repo on 2026-04-07:
 	- `/Users/benjamin/Documents/CodingProjects/etch-a-sketch-main/etch-a-sketch-esp32`
 - App and bootloader binaries generated successfully.
 
+## 2026-04-07 - esp_timer Stack Overflow Mitigation
+
+Observed panic:
+
+- `***ERROR*** A stack overflow in task esp_timer has been detected`
+- Backtrace included Wi-Fi internal timer processing (`ieee80211_timer_process`).
+
+### What changed
+
+- Raised `CONFIG_ESP_TIMER_TASK_STACK_SIZE` from `3584` to `6144` in `sdkconfig`.
+
+### Software engineering rationale
+
+- `esp_timer` is a shared system timer task used by multiple subsystems (including Wi-Fi internals), not only app-level timer callbacks.
+- Overflow in this task indicates configuration pressure on a shared runtime service stack, so increasing the stack is a minimal-risk, bounded mitigation.
+- This keeps app architecture unchanged while removing the immediate crash condition.
+
+### Verification plan
+
+- Rebuild and flash.
+- Monitor boot/runtime logs and confirm no repeated `esp_timer` stack overflow panic under normal drawing + Wi-Fi load.
+
+### References (ESP-IDF / FreeRTOS docs)
+
+- ESP Timer API (task-based dispatch model and timer behavior):
+	- https://docs.espressif.com/projects/esp-idf/en/stable/esp32s2/api-reference/system/esp_timer.html
+
+- ESP-IDF FreeRTOS overview (task stack/high-watermark concepts used for diagnosis):
+	- https://docs.espressif.com/projects/esp-idf/en/stable/esp32s2/api-reference/system/freertos_idf.html
+
+## 2026-04-07 - UART Bring-Up Diagnostics
+
+Added a low-noise ESP32 log for parsed MCXC input state changes:
+
+- `UART input: x=<n> y=<n> penDown=<0|1> erase=<0|1> submit=<0|1>`
+
+### Software engineering rationale
+
+- The MCXC sends `$S,x,y,penDown,erase,submit` continuously, so the ESP32 should log an initial state even before any encoder or button input.
+- Logging only on parsed state changes keeps the monitor readable while still distinguishing UART/parser faults from WebSocket/browser faults.
+- This did not add a new RTOS primitive; it is ordinary task-context diagnostics in the existing UART-to-framebuffer consumer path.
+
+## 2026-04-07 - Live Drawing Latency Tuning
+
+Raised the MCXC-to-ESP32 UART link from 9600 baud to 115200 baud and reduced the MCXC state publish period from 50 ms to 5 ms.
+
+### Software engineering rationale
+
+- At 9600 baud, each ASCII state packet consumes a meaningful fraction of the 50 ms send period.
+- At 115200 baud, the same packet is short enough that a 5 ms update cadence is practical for real-time drawing.
+- The WebSocket path already emits one stroke JSON per parsed UART packet, so increasing the UART producer cadence directly improves browser update cadence without changing the socket protocol.
+- The ESP32 and MCXC baud rates must match; changing only one side will break the UART link.
+
 ## Backlog TODO
 
 - [x] Add runtime stack watermark logs for both tasks to tune stack sizes safely.
 - [x] Convert task/queue names and constants into a small RTOS config block to make future review easier.
-

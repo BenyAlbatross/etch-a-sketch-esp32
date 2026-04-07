@@ -30,9 +30,11 @@
 #define SOCKET_PAYLOAD_BUFFER_SIZE (4U * (((IMAGE_FRAMEBUFFER_CANVAS_WIDTH * IMAGE_FRAMEBUFFER_CANVAS_HEIGHT + 7U) / 8U + 2U) / 3U) + 160U)
 #define UART_PORT_NUM UART_NUM_1
 #define UART_PORT_LABEL "UART1"
-#define UART_BAUD_RATE 9600
+#define UART_BAUD_RATE 115200
 #define UART_TX_PIN 17
-#define UART_RX_PIN 18
+// On ESP32-S2 DevKit boards, GPIO18 is commonly wired to the onboard RGB LED.
+// Keep UART RX on a dedicated pin to avoid contention with LED activity.
+#define UART_RX_PIN 16
 #define UART_RX_BUFFER_SIZE 512
 #define UART_PACKET_BUFFER_SIZE 64
 #define UART_READ_TIMEOUT_MS 100
@@ -55,32 +57,41 @@ enum {
 };
 
 enum {
-    APP_RTOS_PACKET_QUEUE_LENGTH = 16,
+    APP_RTOS_UART_PACKET_QUEUE_LENGTH = 16,
+    APP_RTOS_FRAMEBUFFER_STATE_QUEUE_LENGTH = 64,
     APP_RTOS_UART_RX_TASK_STACK_SIZE = 4096,
+    APP_RTOS_SOCKET_DISPATCH_TASK_STACK_SIZE = 8192,
     APP_RTOS_FRAMEBUFFER_TASK_STACK_SIZE = 12288,
 };
 
 typedef struct {
     const char *uart_rx_task_name;
+    const char *socket_dispatch_task_name;
     const char *framebuffer_task_name;
     uint32_t uart_queue_send_timeout_ms;
+    uint32_t framebuffer_queue_send_timeout_ms;
     uint32_t stack_watermark_log_period_ms;
     UBaseType_t uart_rx_task_priority;
+    UBaseType_t socket_dispatch_task_priority;
     UBaseType_t framebuffer_task_priority;
 } app_rtos_config_t;
 
 static const app_rtos_config_t APP_RTOS_CONFIG = {
     .uart_rx_task_name = "uart_rx_task",
+    .socket_dispatch_task_name = "socket_dispatch_task",
     .framebuffer_task_name = "framebuffer_task",
     .uart_queue_send_timeout_ms = 20U,
+    .framebuffer_queue_send_timeout_ms = 0U,
     .stack_watermark_log_period_ms = 5000U,
     .uart_rx_task_priority = 5,
-    .framebuffer_task_priority = 4,
+    .socket_dispatch_task_priority = 4,
+    .framebuffer_task_priority = 3,
 };
 
 static const char *TAG = "image_framebuffer";
 static image_framebuffer_t s_framebuffer;
 static QueueHandle_t s_uart_packet_queue;
+static QueueHandle_t s_framebuffer_state_queue;
 static EventGroupHandle_t s_wifi_event_group;
 static httpd_handle_t s_ws_server;
 #if CONFIG_HTTPD_WS_SUPPORT
@@ -93,16 +104,33 @@ typedef struct {
     char packet_line[UART_PACKET_BUFFER_SIZE];
 } uart_packet_msg_t;
 
+typedef struct {
+    image_input_state_t state;
+} framebuffer_state_msg_t;
+
 static StaticQueue_t s_uart_packet_queue_struct;
-static uint8_t s_uart_packet_queue_storage[APP_RTOS_PACKET_QUEUE_LENGTH * sizeof(uart_packet_msg_t)];
+static uint8_t s_uart_packet_queue_storage[APP_RTOS_UART_PACKET_QUEUE_LENGTH * sizeof(uart_packet_msg_t)];
+
+static StaticQueue_t s_framebuffer_state_queue_struct;
+static uint8_t s_framebuffer_state_queue_storage[APP_RTOS_FRAMEBUFFER_STATE_QUEUE_LENGTH * sizeof(framebuffer_state_msg_t)];
 
 static StaticTask_t s_uart_rx_task_tcb;
 static StackType_t s_uart_rx_task_stack[APP_RTOS_UART_RX_TASK_STACK_SIZE];
 static TaskHandle_t s_uart_rx_task_handle;
 
+static StaticTask_t s_socket_dispatch_task_tcb;
+static StackType_t s_socket_dispatch_task_stack[APP_RTOS_SOCKET_DISPATCH_TASK_STACK_SIZE];
+static TaskHandle_t s_socket_dispatch_task_handle;
+
 static StaticTask_t s_framebuffer_task_tcb;
 static StackType_t s_framebuffer_task_stack[APP_RTOS_FRAMEBUFFER_TASK_STACK_SIZE];
 static TaskHandle_t s_framebuffer_task_handle;
+
+static uint32_t s_uart_line_count;
+static uint32_t s_uart_queue_drop_count;
+static uint32_t s_framebuffer_queue_drop_count;
+static uint32_t s_uart_parse_ok_count;
+static uint32_t s_uart_parse_fail_count;
 
 static esp_err_t app_socket_send_frame(const char *payload, size_t payload_len);
 
@@ -785,15 +813,96 @@ static void app_maybe_log_stack_watermarks(TickType_t *last_log_tick)
 
     const UBaseType_t uart_rx_stack_hwm =
         (s_uart_rx_task_handle != NULL) ? uxTaskGetStackHighWaterMark(s_uart_rx_task_handle) : 0U;
+    const UBaseType_t socket_dispatch_stack_hwm =
+        (s_socket_dispatch_task_handle != NULL) ? uxTaskGetStackHighWaterMark(s_socket_dispatch_task_handle) : 0U;
     const UBaseType_t framebuffer_stack_hwm =
         (s_framebuffer_task_handle != NULL) ? uxTaskGetStackHighWaterMark(s_framebuffer_task_handle) : 0U;
 
     ESP_LOGI(TAG,
-             "Stack watermark bytes: %s=%u, %s=%u",
+             "Stack watermark bytes: %s=%u, %s=%u, %s=%u",
              APP_RTOS_CONFIG.uart_rx_task_name,
              (unsigned)uart_rx_stack_hwm,
+             APP_RTOS_CONFIG.socket_dispatch_task_name,
+             (unsigned)socket_dispatch_stack_hwm,
              APP_RTOS_CONFIG.framebuffer_task_name,
              (unsigned)framebuffer_stack_hwm);
+
+    *last_log_tick = now;
+}
+
+static bool app_log_period_elapsed(TickType_t *last_log_tick, uint32_t period_ms)
+{
+    if (last_log_tick == NULL) {
+        return true;
+    }
+
+    const TickType_t now = xTaskGetTickCount();
+    const TickType_t period_ticks = pdMS_TO_TICKS(period_ms);
+    if (*last_log_tick != 0 && (now - *last_log_tick) < period_ticks) {
+        return false;
+    }
+
+    *last_log_tick = now;
+    return true;
+}
+
+static void app_log_uart_input_if_changed(const image_input_state_t *state)
+{
+    static image_input_state_t last_state;
+    static bool has_last_state;
+
+    if (state == NULL) {
+        return;
+    }
+
+    const bool changed = !has_last_state ||
+                         state->x != last_state.x ||
+                         state->y != last_state.y ||
+                         state->pen_down != last_state.pen_down ||
+                         state->erase != last_state.erase ||
+                         state->submit != last_state.submit;
+    if (!changed) {
+        return;
+    }
+
+    ESP_LOGI(TAG,
+             "UART input: x=%u y=%u penDown=%u erase=%u submit=%u",
+             (unsigned)state->x,
+             (unsigned)state->y,
+             state->pen_down ? 1U : 0U,
+             state->erase ? 1U : 0U,
+             state->submit ? 1U : 0U);
+
+    last_state = *state;
+    has_last_state = true;
+}
+
+static void app_maybe_log_uart_pipeline_stats(TickType_t *last_log_tick)
+{
+    if (last_log_tick == NULL) {
+        return;
+    }
+
+    const TickType_t now = xTaskGetTickCount();
+    const TickType_t log_period_ticks = pdMS_TO_TICKS(2000);
+    if ((now - *last_log_tick) < log_period_ticks) {
+        return;
+    }
+
+    const UBaseType_t uart_queue_depth =
+        (s_uart_packet_queue != NULL) ? uxQueueMessagesWaiting(s_uart_packet_queue) : 0U;
+    const UBaseType_t framebuffer_queue_depth =
+        (s_framebuffer_state_queue != NULL) ? uxQueueMessagesWaiting(s_framebuffer_state_queue) : 0U;
+
+    ESP_LOGI(TAG,
+             "UART pipeline: lines=%u parsed=%u malformed=%u uartDrops=%u uartDepth=%u fbDrops=%u fbDepth=%u",
+             (unsigned)s_uart_line_count,
+             (unsigned)s_uart_parse_ok_count,
+             (unsigned)s_uart_parse_fail_count,
+             (unsigned)s_uart_queue_drop_count,
+             (unsigned)uart_queue_depth,
+             (unsigned)s_framebuffer_queue_drop_count,
+             (unsigned)framebuffer_queue_depth);
 
     *last_log_tick = now;
 }
@@ -1092,20 +1201,59 @@ static void app_submit_drawing_for_ai(char *socket_payload, size_t socket_payloa
     }
 }
 
-static void app_process_packet_line(const char *packet_line, char *socket_payload, size_t socket_payload_len)
+static void app_enqueue_framebuffer_state(const image_input_state_t *state)
 {
-    image_input_state_t state;
-    if (!image_framebuffer_parse_input_packet(packet_line, &state)) {
-        ESP_LOGW(TAG, "Dropping malformed UART packet: %s", packet_line);
+    if (state == NULL || s_framebuffer_state_queue == NULL) {
         return;
     }
 
-    image_framebuffer_apply_input(&s_framebuffer, &state);
+    framebuffer_state_msg_t msg = {
+        .state = *state,
+    };
 
-    // Viewer updates should be near real-time and independent of submit.
+    const BaseType_t queued = xQueueSend(s_framebuffer_state_queue,
+                                         &msg,
+                                         pdMS_TO_TICKS(APP_RTOS_CONFIG.framebuffer_queue_send_timeout_ms));
+    if (queued != pdPASS) {
+        s_framebuffer_queue_drop_count++;
+    }
+}
+
+static void app_process_packet_line_fast_path(const char *packet_line)
+{
+    static TickType_t last_malformed_log_tick;
+
+    image_input_state_t state;
+    if (!image_framebuffer_parse_input_packet(packet_line, &state)) {
+        s_uart_parse_fail_count++;
+        if (app_log_period_elapsed(&last_malformed_log_tick, 1000U)) {
+            ESP_LOGW(TAG, "Dropping malformed UART packet: %s", packet_line);
+        }
+        return;
+    }
+
+    s_uart_parse_ok_count++;
+
+    app_log_uart_input_if_changed(&state);
+
+    // Fast path: publish raw pen movement to the browser immediately.
     app_send_viewer_stroke_update(&state);
 
-    if (!state.submit) {
+    // Slow path: build authoritative framebuffer state in a lower-priority worker.
+    app_enqueue_framebuffer_state(&state);
+}
+
+static void app_process_framebuffer_state(const image_input_state_t *state,
+                                          char *socket_payload,
+                                          size_t socket_payload_len)
+{
+    if (state == NULL) {
+        return;
+    }
+
+    image_framebuffer_apply_input(&s_framebuffer, state);
+
+    if (!state->submit) {
         return;
     }
 
@@ -1120,13 +1268,18 @@ static void app_uart_rx_task(void *arg)
     char uart_packet[UART_PACKET_BUFFER_SIZE];
     uart_packet_msg_t msg;
     TickType_t last_stack_log_tick = xTaskGetTickCount();
+    TickType_t last_uart_stats_log_tick = last_stack_log_tick;
+    TickType_t last_uart_queue_drop_log_tick = 0;
 
     while (true) {
         app_maybe_log_stack_watermarks(&last_stack_log_tick);
+        app_maybe_log_uart_pipeline_stats(&last_uart_stats_log_tick);
 
         if (!app_uart_read_packet_line(uart_packet, sizeof(uart_packet))) {
             continue;
         }
+
+        s_uart_line_count++;
 
         const size_t len = strnlen(uart_packet, sizeof(msg.packet_line) - 1U);
         memcpy(msg.packet_line, uart_packet, len);
@@ -1136,7 +1289,23 @@ static void app_uart_rx_task(void *arg)
                                              &msg,
                                              pdMS_TO_TICKS(APP_RTOS_CONFIG.uart_queue_send_timeout_ms));
         if (queued != pdPASS) {
-            ESP_LOGW(TAG, "UART packet queue full, dropping packet");
+            s_uart_queue_drop_count++;
+            if (app_log_period_elapsed(&last_uart_queue_drop_log_tick, 1000U)) {
+                ESP_LOGW(TAG, "UART packet queue full, dropping packet");
+            }
+        }
+    }
+}
+
+static void app_socket_dispatch_task(void *arg)
+{
+    (void)arg;
+
+    uart_packet_msg_t msg;
+    while (true) {
+        const BaseType_t received = xQueueReceive(s_uart_packet_queue, &msg, portMAX_DELAY);
+        if (received == pdPASS) {
+            app_process_packet_line_fast_path(msg.packet_line);
         }
     }
 }
@@ -1151,11 +1320,11 @@ static void app_framebuffer_task(void *arg)
         vTaskDelete(NULL);
     }
 
-    uart_packet_msg_t msg;
+    framebuffer_state_msg_t msg;
     while (true) {
-        const BaseType_t received = xQueueReceive(s_uart_packet_queue, &msg, portMAX_DELAY);
+        const BaseType_t received = xQueueReceive(s_framebuffer_state_queue, &msg, portMAX_DELAY);
         if (received == pdPASS) {
-            app_process_packet_line(msg.packet_line, socket_payload, SOCKET_PAYLOAD_BUFFER_SIZE);
+            app_process_framebuffer_state(&msg.state, socket_payload, SOCKET_PAYLOAD_BUFFER_SIZE);
         }
     }
 }
@@ -1184,17 +1353,23 @@ void app_main(void)
         return;
     }
 
-    const esp_err_t prompt_init_err = app_fetch_and_publish_prompt();
-    if (prompt_init_err != ESP_OK) {
-        ESP_LOGW(TAG, "Initial prompt fetch/publish failed: %s", esp_err_to_name(prompt_init_err));
-    }
-
-    s_uart_packet_queue = xQueueCreateStatic(APP_RTOS_PACKET_QUEUE_LENGTH,
+    s_uart_packet_queue = xQueueCreateStatic(APP_RTOS_UART_PACKET_QUEUE_LENGTH,
                                              sizeof(uart_packet_msg_t),
                                              s_uart_packet_queue_storage,
                                              &s_uart_packet_queue_struct);
     if (s_uart_packet_queue == NULL) {
         ESP_LOGE(TAG, "Failed to create UART packet queue");
+        return;
+    }
+
+    s_framebuffer_state_queue = xQueueCreateStatic(APP_RTOS_FRAMEBUFFER_STATE_QUEUE_LENGTH,
+                                                   sizeof(framebuffer_state_msg_t),
+                                                   s_framebuffer_state_queue_storage,
+                                                   &s_framebuffer_state_queue_struct);
+    if (s_framebuffer_state_queue == NULL) {
+        ESP_LOGE(TAG, "Failed to create framebuffer state queue");
+        vQueueDelete(s_uart_packet_queue);
+        s_uart_packet_queue = NULL;
         return;
     }
 
@@ -1207,6 +1382,26 @@ void app_main(void)
                                               &s_uart_rx_task_tcb);
     if (s_uart_rx_task_handle == NULL) {
         ESP_LOGE(TAG, "Failed to create UART RX task");
+        vQueueDelete(s_framebuffer_state_queue);
+        s_framebuffer_state_queue = NULL;
+        vQueueDelete(s_uart_packet_queue);
+        s_uart_packet_queue = NULL;
+        return;
+    }
+
+    s_socket_dispatch_task_handle = xTaskCreateStatic(app_socket_dispatch_task,
+                                                      APP_RTOS_CONFIG.socket_dispatch_task_name,
+                                                      APP_RTOS_SOCKET_DISPATCH_TASK_STACK_SIZE,
+                                                      NULL,
+                                                      APP_RTOS_CONFIG.socket_dispatch_task_priority,
+                                                      s_socket_dispatch_task_stack,
+                                                      &s_socket_dispatch_task_tcb);
+    if (s_socket_dispatch_task_handle == NULL) {
+        ESP_LOGE(TAG, "Failed to create socket dispatch task");
+        vTaskDelete(s_uart_rx_task_handle);
+        s_uart_rx_task_handle = NULL;
+        vQueueDelete(s_framebuffer_state_queue);
+        s_framebuffer_state_queue = NULL;
         vQueueDelete(s_uart_packet_queue);
         s_uart_packet_queue = NULL;
         return;
@@ -1221,15 +1416,25 @@ void app_main(void)
                                                   &s_framebuffer_task_tcb);
     if (s_framebuffer_task_handle == NULL) {
         ESP_LOGE(TAG, "Failed to create framebuffer task");
+        vTaskDelete(s_socket_dispatch_task_handle);
+        s_socket_dispatch_task_handle = NULL;
         vTaskDelete(s_uart_rx_task_handle);
         s_uart_rx_task_handle = NULL;
+        vQueueDelete(s_framebuffer_state_queue);
+        s_framebuffer_state_queue = NULL;
         vQueueDelete(s_uart_packet_queue);
         s_uart_packet_queue = NULL;
         return;
     }
 
     ESP_LOGI(TAG,
-             "RTOS tasks started: %s and %s",
+             "RTOS tasks started: %s, %s and %s",
              APP_RTOS_CONFIG.uart_rx_task_name,
+             APP_RTOS_CONFIG.socket_dispatch_task_name,
              APP_RTOS_CONFIG.framebuffer_task_name);
+
+    const esp_err_t prompt_init_err = app_fetch_and_publish_prompt();
+    if (prompt_init_err != ESP_OK) {
+        ESP_LOGW(TAG, "Initial prompt fetch/publish failed: %s", esp_err_to_name(prompt_init_err));
+    }
 }
