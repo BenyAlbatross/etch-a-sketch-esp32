@@ -8,8 +8,8 @@
 extern "C" {
 #endif
 
-#define IMAGE_FRAMEBUFFER_CANVAS_WIDTH 900
-#define IMAGE_FRAMEBUFFER_CANVAS_HEIGHT 600
+#define IMAGE_FRAMEBUFFER_CANVAS_WIDTH 128
+#define IMAGE_FRAMEBUFFER_CANVAS_HEIGHT 128
 
 typedef struct {
     uint16_t x;
@@ -40,7 +40,7 @@ const image_framebuffer_status_t *image_framebuffer_get_status(const image_frame
 
 /**
  * Builds a JSON payload for socket transport in this shape:
- * {"type":"frame","width":900,"height":600,"format":"1bpp-msb","data":"<base64>"}
+ * {"type":"frame","width":128,"height":128,"format":"1bpp-msb","data":"<base64>"}
  * Returns the number of bytes written (excluding null terminator), or 0 on failure.
  */
 size_t image_framebuffer_build_socket_payload(const image_framebuffer_t *framebuffer, char *out_json, size_t out_json_len);

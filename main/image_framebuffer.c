@@ -1,13 +1,31 @@
 #include "image_framebuffer.h"
 
+#include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
 
 #include "mbedtls/base64.h"
 
 #define IMAGE_FRAMEBUFFER_BYTES ((IMAGE_FRAMEBUFFER_CANVAS_WIDTH * IMAGE_FRAMEBUFFER_CANVAS_HEIGHT + 7U) / 8U)
-#define IMAGE_FRAMEBUFFER_SOCKET_JSON_PREFIX "{\"type\":\"frame\",\"width\":900,\"height\":600,\"format\":\"1bpp-msb\",\"data\":\""
+#define IMAGE_FRAMEBUFFER_SOCKET_JSON_PREFIX "{\"type\":\"frame\",\"width\":128,\"height\":128,\"format\":\"1bpp-msb\",\"data\":\""
 #define IMAGE_FRAMEBUFFER_SOCKET_JSON_SUFFIX "\"}"
+#define IMAGE_FRAMEBUFFER_INPUT_PACKET_BUFFER_LEN 96
+
+static bool image_framebuffer_parse_int_token(const char *token, int *out_value)
+{
+    if (token == NULL || out_value == NULL || token[0] == '\0') {
+        return false;
+    }
+
+    char *end_ptr = NULL;
+    const long parsed = strtol(token, &end_ptr, 10);
+    if (end_ptr == token || *end_ptr != '\0') {
+        return false;
+    }
+
+    *out_value = (int)parsed;
+    return true;
+}
 
 static inline size_t image_framebuffer_index(uint16_t x, uint16_t y)
 {
@@ -88,17 +106,50 @@ bool image_framebuffer_parse_input_packet(const char *packet, image_input_state_
         return false;
     }
 
-    int x = 0;
-    int y = 0;
-    int pen_down = 0;
-    int erase = 0;
-    int submit = 0;
-    char trailing = '\0';
-
-    const int matched = sscanf(packet, "$S,%d,%d,%d,%d,%d%c", &x, &y, &pen_down, &erase, &submit, &trailing);
-    if (matched < 5) {
+    if (strncmp(packet, "$S,", 3U) != 0) {
         return false;
     }
+
+    char packet_copy[IMAGE_FRAMEBUFFER_INPUT_PACKET_BUFFER_LEN];
+    const size_t packet_len = strnlen(packet, sizeof(packet_copy));
+    if (packet_len == 0U || packet_len >= sizeof(packet_copy)) {
+        return false;
+    }
+    memcpy(packet_copy, packet, packet_len);
+    packet_copy[packet_len] = '\0';
+
+    int fields[5] = {0, 0, 0, 0, 0};
+    size_t field_count = 0U;
+
+    char *save_ptr = NULL;
+    char *token = strtok_r(packet_copy + 3, ",", &save_ptr);
+    while (token != NULL && field_count < 5U) {
+        if (!image_framebuffer_parse_int_token(token, &fields[field_count])) {
+            return false;
+        }
+        field_count++;
+        token = strtok_r(NULL, ",", &save_ptr);
+    }
+
+    if (token != NULL) {
+        // More than 5 comma-separated values is invalid.
+        return false;
+    }
+
+    // Backward compatible parsing:
+    // $S,x,y,pen
+    // $S,x,y,pen,erase
+    // $S,x,y,pen,erase,submit
+    if (field_count < 3U) {
+        return false;
+    }
+
+    const int x = fields[0];
+    const int y = fields[1];
+    const int pen_down = fields[2];
+    const int erase = (field_count >= 4U) ? fields[3] : 0;
+    const int submit = (field_count >= 5U) ? fields[4] : 0;
+
     if (x < 0 || x >= IMAGE_FRAMEBUFFER_CANVAS_WIDTH || y < 0 || y >= IMAGE_FRAMEBUFFER_CANVAS_HEIGHT) {
         return false;
     }
