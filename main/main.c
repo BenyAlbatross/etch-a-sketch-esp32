@@ -6,6 +6,7 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdint.h>
 #include <string.h>
 #include <errno.h>
 
@@ -134,6 +135,7 @@ typedef struct {
     int target_fd;
     app_ai_submit_result_t result;
     char prompt_word[APP_API_PROMPT_WORD_BUFFER_SIZE];
+    uint32_t prompt_request_id;
 } framebuffer_state_msg_t;
 
 typedef enum {
@@ -146,6 +148,7 @@ typedef struct {
     size_t payload_len;
     char *payload;
     char prompt_word[APP_API_PROMPT_WORD_BUFFER_SIZE];
+    uint32_t prompt_request_id;
 } api_request_msg_t;
 
 typedef struct {
@@ -206,8 +209,7 @@ static uint32_t s_api_queue_drop_count;
 static uint32_t s_uart_parse_ok_count;
 static uint32_t s_uart_parse_fail_count;
 static uint32_t s_viewer_seq;
-// Temporary integration flag until teammate-owned API layer is connected.
-static bool s_submit_stub_success_flag = true;
+static bool s_local_debug_submit_correct = true;
 
 static void app_enqueue_snapshot_request_event(int target_fd);
 static void app_process_packet_line_fast_path(const char *packet_line);
@@ -220,6 +222,8 @@ static app_phase_t s_app_phase = APP_PHASE_WAITING_FOR_PROMPT;
 static app_ai_submit_result_t s_last_result;
 static bool s_has_result;
 static bool s_prompt_request_in_flight;
+static uint32_t s_next_prompt_request_id;
+static uint32_t s_active_prompt_request_id;
 
 static esp_err_t app_send_mcu_command(const char *command, int value)
 {
@@ -1381,6 +1385,15 @@ static void app_maybe_resend_prompt_ready(const image_input_state_t *state)
     }
 }
 
+static uint32_t app_next_prompt_request_id(void)
+{
+    s_next_prompt_request_id++;
+    if (s_next_prompt_request_id == 0U) {
+        s_next_prompt_request_id = 1U;
+    }
+    return s_next_prompt_request_id;
+}
+
 static void app_process_authoritative_input(const image_input_state_t *state,
                                             app_viewer_delta_buffer_t *delta)
 {
@@ -1409,18 +1422,24 @@ static void app_process_authoritative_input(const image_input_state_t *state,
 
 static bool app_request_prompt_fetch(void)
 {
+    const uint32_t request_id = app_next_prompt_request_id();
     api_request_msg_t request = {
         .type = API_REQUEST_PROMPT,
+        .prompt_request_id = request_id,
     };
     strncpy(request.prompt_word, s_active_prompt_word, sizeof(request.prompt_word) - 1U);
     request.prompt_word[sizeof(request.prompt_word) - 1U] = '\0';
 
+    s_active_prompt_request_id = request_id;
+    s_prompt_request_in_flight = true;
+
     if (!app_enqueue_api_request(&request)) {
         ESP_LOGW(TAG, "Prompt request queue full");
+        s_prompt_request_in_flight = false;
+        s_active_prompt_request_id = 0U;
         return false;
     }
 
-    s_prompt_request_in_flight = true;
     return true;
 }
 
@@ -1429,6 +1448,7 @@ static void app_start_new_prompt_request(void)
     if (s_app_phase == APP_PHASE_RESULT) {
         image_framebuffer_init(&s_framebuffer);
         s_prompt_request_in_flight = false;
+        s_active_prompt_request_id = 0U;
     } else if (s_app_phase == APP_PHASE_DRAWING && s_has_prompt) {
         const esp_err_t notify_err = app_send_mcu_prompt_ready();
         if (notify_err != ESP_OK) {
@@ -1520,9 +1540,32 @@ static void app_finish_submit_request(const app_ai_submit_result_t *result)
              result->correct ? 1U : 0U);
 }
 
-static void app_finish_prompt_request(const char *prompt_word)
+static void app_finish_prompt_request(const char *prompt_word, uint32_t prompt_request_id)
 {
+    if (!s_prompt_request_in_flight || prompt_request_id == 0U ||
+        prompt_request_id != s_active_prompt_request_id) {
+        ESP_LOGW(TAG,
+                 "Ignoring stale prompt response id=%u active=%u in_flight=%u",
+                 (unsigned)prompt_request_id,
+                 (unsigned)s_active_prompt_request_id,
+                 s_prompt_request_in_flight ? 1U : 0U);
+        return;
+    }
+
+    if (s_app_phase != APP_PHASE_WAITING_FOR_PROMPT) {
+        ESP_LOGW(TAG,
+                 "Ignoring prompt response id=%u while phase=%d",
+                 (unsigned)prompt_request_id,
+                 (int)s_app_phase);
+        s_prompt_request_in_flight = false;
+        s_active_prompt_request_id = 0U;
+        return;
+    }
+
     if (prompt_word == NULL || prompt_word[0] == '\0') {
+        ESP_LOGW(TAG, "Ignoring empty prompt response id=%u", (unsigned)prompt_request_id);
+        s_prompt_request_in_flight = false;
+        s_active_prompt_request_id = 0U;
         return;
     }
 
@@ -1532,6 +1575,7 @@ static void app_finish_prompt_request(const char *prompt_word)
     s_has_result = false;
     s_app_phase = APP_PHASE_DRAWING;
     s_prompt_request_in_flight = false;
+    s_active_prompt_request_id = 0U;
 
     app_enqueue_snapshot(APP_VIEWER_TARGET_BROADCAST);
     app_enqueue_legacy_prompt_payload(s_active_prompt_word);
@@ -1578,7 +1622,7 @@ static void app_process_framebuffer_event(const framebuffer_state_msg_t *msg,
     }
 
     if (msg->type == FRAMEBUFFER_EVENT_PROMPT_READY) {
-        app_finish_prompt_request(msg->prompt_word);
+        app_finish_prompt_request(msg->prompt_word, msg->prompt_request_id);
     }
 }
 
@@ -1680,7 +1724,7 @@ static void app_api_task(void *arg)
                                              request.prompt_word,
                                              &result,
                                              &submit_success,
-                                             s_submit_stub_success_flag);
+                                             s_local_debug_submit_correct);
             }
             free(request.payload);
             if (err != ESP_OK) {
@@ -1721,6 +1765,7 @@ static void app_api_task(void *arg)
             framebuffer_state_msg_t response = {
                 .type = FRAMEBUFFER_EVENT_PROMPT_READY,
                 .target_fd = APP_VIEWER_TARGET_BROADCAST,
+                .prompt_request_id = request.prompt_request_id,
             };
             strncpy(response.prompt_word, prompt_word, sizeof(response.prompt_word) - 1U);
             response.prompt_word[sizeof(response.prompt_word) - 1U] = '\0';

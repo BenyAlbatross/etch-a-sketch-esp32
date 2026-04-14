@@ -101,6 +101,58 @@ The MCXC side must agree on baud rate and pinout — see
 `etch-a-sketch-mcxc/source/MCXC444_Project.c` (`BAUD_RATE`, `UART_TX_PIN`,
 `UART_RX_PIN` on `PORTE`).
 
+### TLS certificate bundle requirement (API)
+
+For HTTPS API calls to work reliably (prompt fetch + drawing submit), keep
+`CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_CROSS_SIGNED_VERIFY=y` enabled.
+
+If this option is disabled, TLS verification can fail for API certificate
+chains that depend on cross-signed roots, and ESP32 API calls will fail before
+application-level JSON handling.
+
+To check or enable it:
+
+```sh
+idf.py menuconfig
+```
+
+Then enable `MBEDTLS_CERTIFICATE_BUNDLE_CROSS_SIGNED_VERIFY` under mbedTLS
+certificate-bundle options and rebuild.
+
+## Startup and recovery
+
+Recommended startup order:
+
+1. Start or flash the ESP32 first.
+2. Wait for Wi-Fi, WebSocket, UART, and RTOS task startup logs.
+3. Start or reset the MCXC.
+
+The ESP32 owns the prompt, browser phase, WebSocket snapshots, and submit
+result state. The MCXC owns the joystick, pen state, LEDs, buzzer, and UART
+control flags. On boot, MCXC starts in `ROUND_PHASE_WAITING_PROMPT` with
+`promptRequest=1`, so it immediately asks ESP32 for a prompt.
+
+Expected startup states:
+
+1. **ESP32 first, then MCXC.** This is the preferred path. ESP32 is ready before
+   MCXC starts sending `$S,...,promptRequest=1` packets. ESP32 should publish a
+   prompt to the browser, send `$C,PROMPT,1`, and MCXC should unlock to blue.
+2. **MCXC first, while still waiting for prompt, then ESP32.** This should
+   recover because MCXC keeps sending `promptRequest=1` until it receives
+   `$C,PROMPT,1`. Once ESP32 starts, it should generate or reuse a prompt, send
+   prompt-ready, and MCXC should unlock to blue.
+3. **MCXC already blue, then ESP32 restarts.** This is a recovery case, not a
+   clean continuation. ESP32 has lost its RAM prompt state, so it should treat
+   startup as a new prompt authority event, publish a fresh prompt to the
+   browser, and send `$C,PROMPT,1` again. MCXC should remain unlocked, but may
+   recenter because its `PROMPT=1` handler recenters the cursor.
+
+Duplicate startup prompt requests are acceptable if they are ignored after ESP32
+has already reached drawing phase. A log such as
+`Ignoring prompt response id=<n> while phase=1` means ESP32 was already in
+`APP_PHASE_DRAWING` and rejected a late prompt response instead of changing the
+prompt mid-round.
+
 ## Building and flashing
 
 This is a standard ESP-IDF project. **Build it from this directory only** —

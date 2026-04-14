@@ -9,37 +9,12 @@ dependencies:
       registry_url: https://components.espressif.com/
       type: service
     version: 1.7.19~2
-  espressif/libpng:
-    component_hash: 940ea54356129e5252b8ed50bc535fdce2836d09815e8c362595b5d538471f48
-    dependencies:
-    - name: idf
-      require: private
-      version: '>=5.0'
-    - name: espressif/zlib
-      registry_url: https://components.espressif.com
-      require: private
-      version: ^1.2.13
-    source:
-      registry_url: https://components.espressif.com/
-      type: service
-    version: 1.6.56
-  espressif/zlib:
-    component_hash: 64ea2fd6754c5a05951f1ddb312ac835cd782e68cb5bd9dfcd1c3a107c8fbfbc
-    dependencies:
-    - name: idf
-      require: private
-      version: '>=4.4'
-    source:
-      registry_url: https://components.espressif.com
-      type: service
-    version: 1.3.2
   idf:
     source:
       type: idf
     version: 6.0.0
 direct_dependencies:
 - espressif/cjson
-- espressif/libpng
 - idf
 manifest_hash: 85fe671c52391d04ca5e3c8ff5b367749d899a578793309f4331a6479fdcda8f
 target: esp32s2

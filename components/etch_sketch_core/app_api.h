@@ -33,7 +33,7 @@ esp_err_t app_api_submit_drawing(const char *payload,
                                  const char *active_prompt_word,
                                  app_ai_submit_result_t *out_result,
                                  bool *out_submit_success,
-                                 bool submit_stub_success_flag);
+                                 bool local_debug_submit_correct);
 
 esp_err_t app_api_fetch_and_publish_prompt(app_api_send_frame_fn send_frame,
                                            char *io_active_prompt_word,

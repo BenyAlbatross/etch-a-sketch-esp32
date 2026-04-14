@@ -1,7 +1,6 @@
 #include "app_api.h"
 
 #include <ctype.h>
-#include <setjmp.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -9,13 +8,13 @@
 
 #include "cJSON.h"
 #include "esp_crt_bundle.h"
+#include "esp_heap_caps.h"
 #include "esp_http_client.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "image_framebuffer.h"
 #include "mbedtls/base64.h"
-#include "png.h"
 
 #define APP_OPENAI_RESPONSES_URL "https://api.openai.com/v1/responses"
 #define APP_OPENAI_MODEL "gpt-5.4-nano"
@@ -24,22 +23,43 @@
 #define APP_HTTP_TIMEOUT_MS 30000
 #define APP_HTTP_PERFORM_MAX_ATTEMPTS 3
 #define APP_HTTP_ALLOW_INSECURE_TEST_FALLBACK 1
+#define APP_HTTP_AUTH_HEADER_PREFIX "Bearer "
+#define APP_HTTP_ERROR_BODY_PREVIEW_BYTES 160U
 #define APP_PNG_DATA_URL_PREFIX "data:image/png;base64,"
 #define APP_PROMPT_WORD_COUNT 8U
 #define APP_SUBMIT_CONFIDENCE_PASS_THRESHOLD 6
-#define APP_API_LOCAL_DEBUG_MODE 1
+#define APP_API_LOCAL_DEBUG_MODE 0
+#define APP_API_OPENAI_PROMPT_ENABLED 0
+#define APP_API_OPENAI_SUBMIT_ENABLED 1
+#define APP_PNG_ROW_BYTES (IMAGE_FRAMEBUFFER_CANVAS_WIDTH / 8U)
+#define APP_PNG_SCANLINE_BYTES (APP_PNG_ROW_BYTES + 1U)
+#define APP_PNG_RAW_IMAGE_BYTES (IMAGE_FRAMEBUFFER_CANVAS_HEIGHT * APP_PNG_SCANLINE_BYTES)
+#define APP_PNG_ZLIB_HEADER_BYTES 2U
+#define APP_PNG_DEFLATE_BLOCK_HEADER_BYTES 5U
+#define APP_PNG_ADLER32_BYTES 4U
+#define APP_PNG_IDAT_DATA_BYTES (APP_PNG_ZLIB_HEADER_BYTES + APP_PNG_DEFLATE_BLOCK_HEADER_BYTES + APP_PNG_RAW_IMAGE_BYTES + APP_PNG_ADLER32_BYTES)
+#define APP_PNG_SIGNATURE_BYTES 8U
+#define APP_PNG_CHUNK_OVERHEAD_BYTES 12U
+#define APP_PNG_IHDR_DATA_BYTES 13U
+#define APP_PNG_MAX_BYTES (APP_PNG_SIGNATURE_BYTES + \
+                           APP_PNG_CHUNK_OVERHEAD_BYTES + APP_PNG_IHDR_DATA_BYTES + \
+                           APP_PNG_CHUNK_OVERHEAD_BYTES + APP_PNG_IDAT_DATA_BYTES + \
+                           APP_PNG_CHUNK_OVERHEAD_BYTES)
+#define APP_ADLER32_MOD 65521U
+
+#if (IMAGE_FRAMEBUFFER_CANVAS_WIDTH % 8U) != 0
+#error "PNG encoder requires framebuffer width to be divisible by 8"
+#endif
+
+#if APP_PNG_RAW_IMAGE_BYTES > 65535U
+#error "PNG encoder uses one uncompressed DEFLATE block and requires raw image bytes <= 65535"
+#endif
 
 typedef struct {
     char *buffer;
     size_t capacity;
     size_t length;
 } app_http_response_buffer_t;
-
-typedef struct {
-    uint8_t *data;
-    size_t length;
-    size_t capacity;
-} app_png_memory_writer_t;
 
 static const char *TAG = "app_api";
 static const char *s_openai_api_key = "";
@@ -75,8 +95,31 @@ void app_api_set_http_post_for_test(app_api_http_post_fn http_post)
 
 void app_api_set_local_debug_mode_for_test(bool enabled)
 {
+#if APP_API_OPENAI_SUBMIT_ENABLED
     s_local_debug_mode = enabled;
+#else
+    (void)enabled;
+    s_local_debug_mode = true;
+#endif
     s_prompt_word_index = 0U;
+}
+
+static bool app_api_use_local_debug_mode(void)
+{
+#if APP_API_OPENAI_SUBMIT_ENABLED
+    return s_local_debug_mode;
+#else
+    return true;
+#endif
+}
+
+static void app_log_submit_heap_snapshot(const char *label)
+{
+    ESP_LOGI(TAG,
+             "%s heap: free=%zu largest=%zu",
+             label,
+             heap_caps_get_free_size(MALLOC_CAP_8BIT),
+             heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
 }
 
 static bool app_is_api_key_configured(void)
@@ -84,6 +127,31 @@ static bool app_is_api_key_configured(void)
     return (s_openai_api_key[0] != '\0') && (strcmp(s_openai_api_key, "YOUR_OPENAI_API_KEY") != 0);
 }
 
+static esp_err_t app_build_authorization_header(char **out_header)
+{
+    if (out_header == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    *out_header = NULL;
+    const size_t prefix_len = sizeof(APP_HTTP_AUTH_HEADER_PREFIX) - 1U;
+    const size_t key_len = strlen(s_openai_api_key);
+    if (key_len > SIZE_MAX - prefix_len - 1U) {
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    char *header = (char *)malloc(prefix_len + key_len + 1U);
+    if (header == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
+
+    memcpy(header, APP_HTTP_AUTH_HEADER_PREFIX, prefix_len);
+    memcpy(header + prefix_len, s_openai_api_key, key_len + 1U);
+    *out_header = header;
+    return ESP_OK;
+}
+
+#if APP_API_OPENAI_PROMPT_ENABLED
 static bool app_is_allowed_prompt_word(const char *word)
 {
     if (word == NULL) {
@@ -97,6 +165,7 @@ static bool app_is_allowed_prompt_word(const char *word)
     }
     return false;
 }
+#endif
 
 static void app_set_submit_result(app_ai_submit_result_t *out_result,
                                   const char *guess,
@@ -183,6 +252,32 @@ static esp_err_t app_http_perform_with_retry(esp_http_client_handle_t client, co
     return err;
 }
 
+static void app_log_http_error_response(const char *phase, int status_code, const char *response_body)
+{
+    char preview[APP_HTTP_ERROR_BODY_PREVIEW_BYTES + 1U];
+    size_t preview_len = 0U;
+
+    if (response_body != NULL) {
+        preview_len = strnlen(response_body, APP_HTTP_ERROR_BODY_PREVIEW_BYTES);
+        for (size_t i = 0U; i < preview_len; ++i) {
+            const unsigned char ch = (unsigned char)response_body[i];
+            preview[i] = (ch >= 0x20U && ch <= 0x7eU) ? (char)ch : ' ';
+        }
+    }
+    preview[preview_len] = '\0';
+
+    if (preview_len > 0U) {
+        ESP_LOGE(TAG,
+                 "%s HTTP POST rejected: status=%d body='%s%s'",
+                 phase,
+                 status_code,
+                 preview,
+                 (response_body[preview_len] != '\0') ? "..." : "");
+    } else {
+        ESP_LOGE(TAG, "%s HTTP POST rejected: status=%d", phase, status_code);
+    }
+}
+
 static esp_err_t app_http_post_json_once(const char *url,
                                          const char *body,
                                          char *out_response,
@@ -201,10 +296,10 @@ static esp_err_t app_http_post_json_once(const char *url,
         .length = 0U,
     };
 
-    char auth_header[160];
-    const int auth_written = snprintf(auth_header, sizeof(auth_header), "Bearer %s", s_openai_api_key);
-    if (auth_written <= 0 || (size_t)auth_written >= sizeof(auth_header)) {
-        return ESP_ERR_INVALID_SIZE;
+    char *auth_header = NULL;
+    esp_err_t err = app_build_authorization_header(&auth_header);
+    if (err != ESP_OK) {
+        return err;
     }
 
     esp_http_client_config_t config = {
@@ -219,15 +314,45 @@ static esp_err_t app_http_post_json_once(const char *url,
 
     esp_http_client_handle_t client = esp_http_client_init(&config);
     if (client == NULL) {
+        free(auth_header);
         return ESP_ERR_NO_MEM;
     }
 
-    esp_http_client_set_header(client, "Content-Type", "application/json");
-    esp_http_client_set_header(client, "Authorization", auth_header);
-    esp_http_client_set_post_field(client, body, strlen(body));
+    err = esp_http_client_set_header(client, "Content-Type", "application/json");
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "%s HTTP Content-Type header setup failed: %s", phase, esp_err_to_name(err));
+        esp_http_client_cleanup(client);
+        free(auth_header);
+        return err;
+    }
 
-    const esp_err_t err = app_http_perform_with_retry(client, phase);
+    err = esp_http_client_set_header(client, "Authorization", auth_header);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "%s HTTP Authorization header setup failed: %s", phase, esp_err_to_name(err));
+        esp_http_client_cleanup(client);
+        free(auth_header);
+        return err;
+    }
+
+    err = esp_http_client_set_post_field(client, body, strlen(body));
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "%s HTTP POST body setup failed: %s", phase, esp_err_to_name(err));
+        esp_http_client_cleanup(client);
+        free(auth_header);
+        return err;
+    }
+
+    err = app_http_perform_with_retry(client, phase);
+    if (err == ESP_OK) {
+        const int status_code = esp_http_client_get_status_code(client);
+        if (status_code < 200 || status_code >= 300) {
+            app_log_http_error_response(phase, status_code, out_response);
+            err = ESP_ERR_INVALID_RESPONSE;
+        }
+    }
+
     esp_http_client_cleanup(client);
+    free(auth_header);
     return err;
 }
 
@@ -261,6 +386,7 @@ static esp_err_t app_http_post_json(const char *url,
     return secure_err;
 }
 
+#if APP_API_OPENAI_PROMPT_ENABLED
 static void app_sanitize_token(const char *input, char *output, size_t output_len)
 {
     if (output == NULL || output_len == 0U) {
@@ -311,6 +437,7 @@ static bool app_try_extract_prompt_word(const char *content,
     app_sanitize_token(content, out_word, out_word_len);
     return out_word[0] != '\0' && app_is_allowed_prompt_word(out_word);
 }
+#endif
 
 static bool app_copy_string(char *out, size_t out_len, const char *value)
 {
@@ -514,103 +641,179 @@ static esp_err_t app_decode_framebuffer_bytes(const char *payload,
     return ESP_OK;
 }
 
-static void app_png_memory_write(png_structp png_ptr, png_bytep data, png_size_t length)
+static void app_write_be32(uint8_t *out, uint32_t value)
 {
-    app_png_memory_writer_t *writer = (app_png_memory_writer_t *)png_get_io_ptr(png_ptr);
-    if (writer == NULL || data == NULL) {
-        png_error(png_ptr, "invalid PNG memory writer");
-        return;
-    }
-
-    if (length > SIZE_MAX - writer->length) {
-        png_error(png_ptr, "PNG output size overflow");
-        return;
-    }
-
-    const size_t needed = writer->length + (size_t)length;
-    if (needed > writer->capacity) {
-        size_t next_capacity = (writer->capacity == 0U) ? 1024U : writer->capacity;
-        while (next_capacity < needed) {
-            if (next_capacity > SIZE_MAX / 2U) {
-                next_capacity = needed;
-                break;
-            }
-            next_capacity *= 2U;
-        }
-
-        uint8_t *next_data = (uint8_t *)realloc(writer->data, next_capacity);
-        if (next_data == NULL) {
-            png_error(png_ptr, "PNG output allocation failed");
-            return;
-        }
-        writer->data = next_data;
-        writer->capacity = next_capacity;
-    }
-
-    memcpy(writer->data + writer->length, data, (size_t)length);
-    writer->length += (size_t)length;
+    out[0] = (uint8_t)(value >> 24);
+    out[1] = (uint8_t)(value >> 16);
+    out[2] = (uint8_t)(value >> 8);
+    out[3] = (uint8_t)value;
 }
 
-static void app_png_memory_flush(png_structp png_ptr)
+static void app_write_le16(uint8_t *out, uint16_t value)
 {
-    (void)png_ptr;
+    out[0] = (uint8_t)value;
+    out[1] = (uint8_t)(value >> 8);
+}
+
+static uint32_t app_crc32_update(uint32_t crc, const uint8_t *data, size_t data_len)
+{
+    for (size_t i = 0U; i < data_len; ++i) {
+        crc ^= data[i];
+        for (uint8_t bit = 0U; bit < 8U; ++bit) {
+            const uint32_t mask = (uint32_t)(0U - (crc & 1U));
+            crc = (crc >> 1U) ^ (0xedb88320U & mask);
+        }
+    }
+    return crc;
+}
+
+static uint32_t app_png_chunk_crc(const char type[4], const uint8_t *data, size_t data_len)
+{
+    uint32_t crc = 0xffffffffU;
+    crc = app_crc32_update(crc, (const uint8_t *)type, 4U);
+    if (data != NULL && data_len > 0U) {
+        crc = app_crc32_update(crc, data, data_len);
+    }
+    return crc ^ 0xffffffffU;
+}
+
+static uint32_t app_adler32(const uint8_t *data, size_t data_len)
+{
+    uint32_t a = 1U;
+    uint32_t b = 0U;
+    for (size_t i = 0U; i < data_len; ++i) {
+        a = (a + data[i]) % APP_ADLER32_MOD;
+        b = (b + a) % APP_ADLER32_MOD;
+    }
+    return (b << 16U) | a;
+}
+
+static void app_build_png_raw_scanlines(const uint8_t *framebuffer, uint8_t *raw)
+{
+    size_t raw_offset = 0U;
+    for (uint32_t y = 0U; y < IMAGE_FRAMEBUFFER_CANVAS_HEIGHT; ++y) {
+        const size_t framebuffer_offset = (size_t)y * APP_PNG_ROW_BYTES;
+        raw[raw_offset++] = 0U;
+        for (size_t x = 0U; x < APP_PNG_ROW_BYTES; ++x) {
+            raw[raw_offset++] = (uint8_t)~framebuffer[framebuffer_offset + x];
+        }
+    }
+}
+
+static esp_err_t app_png_append_chunk(uint8_t *png,
+                                      size_t png_capacity,
+                                      size_t *png_len,
+                                      const char type[4],
+                                      const uint8_t *data,
+                                      size_t data_len)
+{
+    if (png == NULL || png_len == NULL || type == NULL || data_len > UINT32_MAX) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (*png_len > png_capacity || png_capacity - *png_len < APP_PNG_CHUNK_OVERHEAD_BYTES + data_len) {
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    uint8_t *chunk = png + *png_len;
+    app_write_be32(chunk, (uint32_t)data_len);
+    memcpy(chunk + 4U, type, 4U);
+    if (data != NULL && data_len > 0U) {
+        memcpy(chunk + 8U, data, data_len);
+    }
+    app_write_be32(chunk + 8U + data_len, app_png_chunk_crc(type, data, data_len));
+    *png_len += APP_PNG_CHUNK_OVERHEAD_BYTES + data_len;
+    return ESP_OK;
+}
+
+static esp_err_t app_png_append_uncompressed_idat(uint8_t *png,
+                                                  size_t png_capacity,
+                                                  size_t *png_len,
+                                                  const uint8_t *raw,
+                                                  size_t raw_len)
+{
+    if (png == NULL || png_len == NULL || raw == NULL || raw_len > UINT16_MAX) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (*png_len > png_capacity || png_capacity - *png_len < APP_PNG_CHUNK_OVERHEAD_BYTES + APP_PNG_IDAT_DATA_BYTES) {
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    uint8_t *chunk = png + *png_len;
+    uint8_t *idat = chunk + 8U;
+    size_t idat_offset = 0U;
+    const uint16_t block_len = (uint16_t)raw_len;
+    const uint16_t block_nlen = (uint16_t)~block_len;
+
+    app_write_be32(chunk, APP_PNG_IDAT_DATA_BYTES);
+    memcpy(chunk + 4U, "IDAT", 4U);
+
+    idat[idat_offset++] = 0x78U;
+    idat[idat_offset++] = 0x01U;
+    idat[idat_offset++] = 0x01U;
+    app_write_le16(idat + idat_offset, block_len);
+    idat_offset += 2U;
+    app_write_le16(idat + idat_offset, block_nlen);
+    idat_offset += 2U;
+    memcpy(idat + idat_offset, raw, raw_len);
+    idat_offset += raw_len;
+    app_write_be32(idat + idat_offset, app_adler32(raw, raw_len));
+    idat_offset += APP_PNG_ADLER32_BYTES;
+
+    if (idat_offset != APP_PNG_IDAT_DATA_BYTES) {
+        return ESP_FAIL;
+    }
+
+    app_write_be32(chunk + 8U + idat_offset, app_png_chunk_crc("IDAT", idat, idat_offset));
+    *png_len += APP_PNG_CHUNK_OVERHEAD_BYTES + idat_offset;
+    return ESP_OK;
 }
 
 static esp_err_t app_encode_framebuffer_png_1bpp(const uint8_t *framebuffer,
-                                                 uint8_t **out_png,
+                                                 uint8_t *out_png,
+                                                 size_t out_png_capacity,
                                                  size_t *out_png_len)
 {
     if (framebuffer == NULL || out_png == NULL || out_png_len == NULL) {
         return ESP_ERR_INVALID_ARG;
     }
 
-    *out_png = NULL;
-    *out_png_len = 0U;
+    uint8_t raw[APP_PNG_RAW_IMAGE_BYTES];
+    uint8_t ihdr[APP_PNG_IHDR_DATA_BYTES] = {0};
+    static const uint8_t png_signature[APP_PNG_SIGNATURE_BYTES] = {
+        0x89U, 'P', 'N', 'G', '\r', '\n', 0x1aU, '\n',
+    };
 
-    png_structp png_ptr = png_create_write_struct(PNG_LIBPNG_VER_STRING, NULL, NULL, NULL);
-    if (png_ptr == NULL) {
-        return ESP_ERR_NO_MEM;
+    if (out_png_capacity < APP_PNG_MAX_BYTES) {
+        return ESP_ERR_INVALID_SIZE;
     }
 
-    png_infop info_ptr = png_create_info_struct(png_ptr);
-    if (info_ptr == NULL) {
-        png_destroy_write_struct(&png_ptr, NULL);
-        return ESP_ERR_NO_MEM;
+    app_build_png_raw_scanlines(framebuffer, raw);
+    app_write_be32(ihdr, IMAGE_FRAMEBUFFER_CANVAS_WIDTH);
+    app_write_be32(ihdr + 4U, IMAGE_FRAMEBUFFER_CANVAS_HEIGHT);
+    ihdr[8] = 1U;
+    ihdr[9] = 0U;
+    ihdr[10] = 0U;
+    ihdr[11] = 0U;
+    ihdr[12] = 0U;
+
+    size_t png_len = 0U;
+    memcpy(out_png, png_signature, sizeof(png_signature));
+    png_len += sizeof(png_signature);
+
+    esp_err_t err = app_png_append_chunk(out_png, out_png_capacity, &png_len, "IHDR", ihdr, sizeof(ihdr));
+    if (err != ESP_OK) {
+        return err;
+    }
+    err = app_png_append_uncompressed_idat(out_png, out_png_capacity, &png_len, raw, sizeof(raw));
+    if (err != ESP_OK) {
+        return err;
+    }
+    err = app_png_append_chunk(out_png, out_png_capacity, &png_len, "IEND", NULL, 0U);
+    if (err != ESP_OK) {
+        return err;
     }
 
-    app_png_memory_writer_t writer = {0};
-    if (setjmp(png_jmpbuf(png_ptr))) {
-        png_destroy_write_struct(&png_ptr, &info_ptr);
-        free(writer.data);
-        return ESP_FAIL;
-    }
-
-    png_set_write_fn(png_ptr, &writer, app_png_memory_write, app_png_memory_flush);
-    png_set_IHDR(png_ptr,
-                 info_ptr,
-                 IMAGE_FRAMEBUFFER_CANVAS_WIDTH,
-                 IMAGE_FRAMEBUFFER_CANVAS_HEIGHT,
-                 1,
-                 PNG_COLOR_TYPE_GRAY,
-                 PNG_INTERLACE_NONE,
-                 PNG_COMPRESSION_TYPE_DEFAULT,
-                 PNG_FILTER_TYPE_DEFAULT);
-    png_write_info(png_ptr, info_ptr);
-
-    uint8_t row[IMAGE_FRAMEBUFFER_CANVAS_WIDTH / 8U];
-    for (uint32_t y = 0U; y < IMAGE_FRAMEBUFFER_CANVAS_HEIGHT; ++y) {
-        const size_t row_offset = (size_t)y * sizeof(row);
-        for (size_t x = 0U; x < sizeof(row); ++x) {
-            row[x] = (uint8_t)~framebuffer[row_offset + x];
-        }
-        png_write_row(png_ptr, row);
-    }
-
-    png_write_end(png_ptr, info_ptr);
-    png_destroy_write_struct(&png_ptr, &info_ptr);
-
-    *out_png = writer.data;
-    *out_png_len = writer.length;
+    *out_png_len = png_len;
     return ESP_OK;
 }
 
@@ -625,9 +828,9 @@ static esp_err_t app_build_png_data_url_from_framebuffer(const uint8_t *framebuf
     *out_data_url = NULL;
     *out_data_url_len = 0U;
 
-    uint8_t *png = NULL;
+    uint8_t png[APP_PNG_MAX_BYTES];
     size_t png_len = 0U;
-    esp_err_t err = app_encode_framebuffer_png_1bpp(framebuffer, &png, &png_len);
+    esp_err_t err = app_encode_framebuffer_png_1bpp(framebuffer, png, sizeof(png), &png_len);
     if (err != ESP_OK) {
         return err;
     }
@@ -636,7 +839,6 @@ static esp_err_t app_build_png_data_url_from_framebuffer(const uint8_t *framebuf
     const size_t base64_len = 4U * ((png_len + 2U) / 3U);
     char *data_url = (char *)malloc(prefix_len + base64_len + 1U);
     if (data_url == NULL) {
-        free(png);
         return ESP_ERR_NO_MEM;
     }
 
@@ -647,7 +849,6 @@ static esp_err_t app_build_png_data_url_from_framebuffer(const uint8_t *framebuf
                                           &written,
                                           png,
                                           png_len);
-    free(png);
     if (ret != 0) {
         free(data_url);
         return ESP_FAIL;
@@ -700,6 +901,7 @@ static cJSON *app_create_string_array(const char *const *values, size_t value_co
     return array;
 }
 
+#if APP_API_OPENAI_PROMPT_ENABLED
 static cJSON *app_create_prompt_schema(void)
 {
     cJSON *schema = cJSON_CreateObject();
@@ -735,21 +937,20 @@ static cJSON *app_create_prompt_schema(void)
     cJSON_AddBoolToObject(schema, "additionalProperties", false);
     return schema;
 }
+#endif
 
 static cJSON *app_create_submit_schema(void)
 {
     cJSON *schema = cJSON_CreateObject();
     cJSON *properties = cJSON_CreateObject();
-    cJSON *reasoning = cJSON_CreateObject();
     cJSON *guess = cJSON_CreateObject();
     cJSON *confidence = cJSON_CreateObject();
     cJSON *correct = cJSON_CreateObject();
     cJSON *required = NULL;
-    if (schema == NULL || properties == NULL || reasoning == NULL ||
-        guess == NULL || confidence == NULL || correct == NULL) {
+    if (schema == NULL || properties == NULL || guess == NULL ||
+        confidence == NULL || correct == NULL) {
         cJSON_Delete(schema);
         cJSON_Delete(properties);
-        cJSON_Delete(reasoning);
         cJSON_Delete(guess);
         cJSON_Delete(confidence);
         cJSON_Delete(correct);
@@ -757,20 +958,18 @@ static cJSON *app_create_submit_schema(void)
     }
 
     cJSON_AddStringToObject(schema, "type", "object");
-    cJSON_AddStringToObject(reasoning, "type", "string");
     cJSON_AddStringToObject(guess, "type", "string");
     cJSON_AddStringToObject(confidence, "type", "integer");
     cJSON_AddNumberToObject(confidence, "minimum", 1);
     cJSON_AddNumberToObject(confidence, "maximum", 10);
     cJSON_AddStringToObject(correct, "type", "boolean");
 
-    cJSON_AddItemToObject(properties, "reasoning", reasoning);
     cJSON_AddItemToObject(properties, "guess", guess);
     cJSON_AddItemToObject(properties, "confidence", confidence);
     cJSON_AddItemToObject(properties, "correct", correct);
     cJSON_AddItemToObject(schema, "properties", properties);
 
-    required = app_create_string_array((const char *const[]){"reasoning", "guess", "confidence", "correct"}, 4U);
+    required = app_create_string_array((const char *const[]){"guess", "confidence", "correct"}, 3U);
     if (required == NULL) {
         cJSON_Delete(schema);
         return NULL;
@@ -805,6 +1004,7 @@ static bool app_add_text_format(cJSON *root, const char *name, cJSON *schema)
     return true;
 }
 
+#if APP_API_OPENAI_PROMPT_ENABLED
 static char *app_build_prompt_request_body(void)
 {
     cJSON *root = cJSON_CreateObject();
@@ -833,6 +1033,7 @@ static char *app_build_prompt_request_body(void)
     cJSON_Delete(root);
     return request_body;
 }
+#endif
 
 static char *app_build_submit_request_body(const char *active_prompt_word, const char *data_url)
 {
@@ -910,7 +1111,7 @@ esp_err_t app_api_submit_drawing(const char *payload,
                                  const char *active_prompt_word,
                                  app_ai_submit_result_t *out_result,
                                  bool *out_submit_success,
-                                 bool submit_stub_success_flag)
+                                 bool local_debug_submit_correct)
 {
     if (payload == NULL || payload_len == 0U || active_prompt_word == NULL ||
         out_result == NULL || out_submit_success == NULL) {
@@ -920,8 +1121,8 @@ esp_err_t app_api_submit_drawing(const char *payload,
     *out_submit_success = false;
     app_set_submit_result(out_result, "unknown", 1, false);
 
-    if (s_local_debug_mode) {
-        const bool correct = submit_stub_success_flag;
+    if (app_api_use_local_debug_mode()) {
+        const bool correct = local_debug_submit_correct;
         const char *guess = (active_prompt_word[0] != '\0') ? active_prompt_word : "local-debug";
         app_set_submit_result(out_result, guess, correct ? 10 : 1, correct);
         *out_submit_success = true;
@@ -933,6 +1134,10 @@ esp_err_t app_api_submit_drawing(const char *payload,
         return ESP_OK;
     }
 
+#if !APP_API_OPENAI_SUBMIT_ENABLED
+    ESP_LOGW(TAG, "OpenAI submit path disabled by APP_API_OPENAI_SUBMIT_ENABLED");
+    return ESP_ERR_NOT_SUPPORTED;
+#else
     if (!app_is_api_key_configured()) {
         ESP_LOGW(TAG, "OpenAI API key not configured, unable to submit drawing");
         return ESP_ERR_INVALID_STATE;
@@ -940,7 +1145,9 @@ esp_err_t app_api_submit_drawing(const char *payload,
 
     char *data_url = NULL;
     size_t data_url_len = 0U;
+    app_log_submit_heap_snapshot("Before PNG data URL build");
     esp_err_t err = app_api_build_frame_png_data_url(payload, payload_len, &data_url, &data_url_len);
+    app_log_submit_heap_snapshot("After PNG data URL build");
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "Failed to build PNG data URL: %s", esp_err_to_name(err));
         return err;
@@ -989,6 +1196,7 @@ esp_err_t app_api_submit_drawing(const char *payload,
              out_result->confidence,
              out_result->correct ? 1U : 0U);
     return ESP_OK;
+#endif
 }
 
 esp_err_t app_api_fetch_and_publish_prompt(app_api_send_frame_fn send_frame,
@@ -999,36 +1207,8 @@ esp_err_t app_api_fetch_and_publish_prompt(app_api_send_frame_fn send_frame,
         return ESP_ERR_INVALID_ARG;
     }
 
-    if (s_local_debug_mode) {
-        app_select_next_local_prompt_word(io_active_prompt_word, io_active_prompt_word_len);
-        ESP_LOGI(TAG, "Using local prompt word list");
-    } else if (!app_is_api_key_configured()) {
-        ESP_LOGW(TAG, "OPENAI_API_KEY is not configured; using default prompt '%s'", io_active_prompt_word);
-    } else {
-        char *request_body = app_build_prompt_request_body();
-        if (request_body == NULL) {
-            return ESP_ERR_NO_MEM;
-        }
-
-        char http_response[APP_HTTP_RESPONSE_BUFFER_SIZE];
-        const esp_err_t prompt_err = s_http_post_json(APP_OPENAI_RESPONSES_URL,
-                                                      request_body,
-                                                      http_response,
-                                                      sizeof(http_response));
-        free(request_body);
-        if (prompt_err == ESP_OK) {
-            char content[APP_AI_CONTENT_BUFFER_SIZE];
-            if (app_extract_responses_output_text(http_response, content, sizeof(content))) {
-                char prompt_word[APP_API_PROMPT_WORD_BUFFER_SIZE];
-                if (app_try_extract_prompt_word(content, prompt_word, sizeof(prompt_word))) {
-                    strncpy(io_active_prompt_word, prompt_word, io_active_prompt_word_len - 1U);
-                    io_active_prompt_word[io_active_prompt_word_len - 1U] = '\0';
-                }
-            }
-        } else {
-            ESP_LOGW(TAG, "Prompt fetch failed: %s", esp_err_to_name(prompt_err));
-        }
-    }
+    app_select_next_local_prompt_word(io_active_prompt_word, io_active_prompt_word_len);
+    ESP_LOGI(TAG, "Using local prompt word list");
 
     char prompt_json[128];
     const int prompt_written = snprintf(prompt_json,
