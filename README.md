@@ -31,12 +31,48 @@ canonical drawing state and connects three things together:
   encodes the framebuffer into a `{"type":"frame",...}` JSON envelope and
   POSTs it to the backend's drawing-submit endpoint, then fetches the next
   prompt and publishes it back over the WebSocket.
+
+  The submit request instruction sent to the model is:
+
+  > "Grade this Etch-a-Sketch drawing against the target word 'triangle'. Use
+  > confidence 1 for no match and 10 for excellent match; set correct true at
+  > confidence 6 or higher."
+
+  The drawing is only graded correct if the AI's returned confidence passes
+  the threshold (`APP_SUBMIT_CONFIDENCE_PASS_THRESHOLD` in `app_api.c`, default
+  6). `'triangle'` is substituted with the active prompt word.
 - **Wi-Fi + HTTP client.** Joins the Wi-Fi network defined in `secrets.h`,
   performs the prompt-fetch and submit calls with `esp_http_client`, and
   hosts the local WebSocket server with `esp_http_server`.
 - **Diagnostics.** Periodic logs of UART pipeline counters
   (`lines / parsed / malformed / queueDrops / queueDepth`), WebSocket client
   count, and per-task stack high-water marks make bring-up easier.
+
+## RTOS task priorities
+
+Current application task priorities are set in `main/main.c`:
+
+- `viewer_task` = 7
+- `state_dispatch_task` = 6
+- `uart_rx_task` = 5
+- `framebuffer_task` = 3
+- `api_task` = 3
+
+Rationale for the ordering:
+
+- Queue stage 1 (`s_uart_packet_queue`): `state_dispatch_task` is the consumer
+  and `uart_rx_task` is the producer, so consumer priority is higher to drain
+  bursts quickly.
+- Viewer stage (`s_viewer_event_queue`): `viewer_task` is set highest so
+  WebSocket payloads drain quickly and draw-to-screen latency stays low.
+- `framebuffer_task` and `api_task` are kept lower in this tuning profile; use
+  UART pipeline counters (`fbDrops`, `fbDepth`, `viewerDrops`, `viewerDepth`)
+  to verify this balance remains healthy under sustained input.
+
+Reference:
+
+- ESP-IDF FreeRTOS task scheduling and priorities:
+  https://docs.espressif.com/projects/esp-idf/en/stable/esp32s2/api-reference/system/freertos_idf.html
 
 ## Packet format mapping (UART vs WebSocket)
 
