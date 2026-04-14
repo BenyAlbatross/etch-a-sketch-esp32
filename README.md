@@ -101,6 +101,34 @@ The MCXC side must agree on baud rate and pinout — see
 `etch-a-sketch-mcxc/source/MCXC444_Project.c` (`BAUD_RATE`, `UART_TX_PIN`,
 `UART_RX_PIN` on `PORTE`).
 
+### Local debug toggle (submit path)
+
+There are two related debug knobs in the ESP32 firmware:
+
+1. **Enable/disable local debug submit mode**
+  - File: `components/etch_sketch_core/app_api.c`
+  - Macro: `APP_API_LOCAL_DEBUG_MODE`
+  - Set to `1`: submit returns a local simulated result (no OpenAI call).
+  - Set to `0`: submit uses the OpenAI path (when API key/config are valid).
+
+2. **Choose simulated result correctness (when local debug mode is ON)**
+  - File: `main/main.c`
+  - Variable: `s_local_debug_submit_correct`
+  - Set to `true`: submit emits a correct result (`$C,RESULT,1`).
+  - Set to `false`: submit emits a wrong result (`$C,RESULT,0`).
+
+Quick toggle workflow:
+
+```c
+/* components/etch_sketch_core/app_api.c */
+#define APP_API_LOCAL_DEBUG_MODE 1
+
+/* main/main.c */
+static bool s_local_debug_submit_correct = true;
+```
+
+After changing either value, rebuild and flash the ESP32 firmware.
+
 ### TLS certificate bundle requirement (API)
 
 For HTTPS API calls to work reliably (prompt fetch + drawing submit), keep
@@ -173,6 +201,32 @@ traceback, the most common causes on this board are:
 2. A serial monitor is still holding the port — close it and retry.
 3. The board didn't enter download mode — hold `BOOT`, tap `RST`, release
    `BOOT`, then re-run `flash`.
+
+## Host utility check (`tools/`)
+
+`tools/write_circle_png.c` is a standalone host utility for quickly validating
+the 128x128 1-bit PNG output path without flashing the ESP32. It draws a ring
+into a test framebuffer and writes a PNG file.
+
+Compile and run from this project root:
+
+```sh
+cd etch-a-sketch-esp32
+cc -std=c11 -Wall -Wextra -Werror -O2 tools/write_circle_png.c -o build/write_circle_png
+./build/write_circle_png build/circle.png
+```
+
+Quick checks:
+
+```sh
+file build/circle.png
+# expected: PNG image data, 128 x 128, 1-bit grayscale, non-interlaced
+
+ls -lh build/circle.png
+
+open build/circle.png
+# expected: a black ring on a white background
+```
 
 ## VS Code / ESP-IDF workspace files
 
