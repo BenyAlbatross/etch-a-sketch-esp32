@@ -16,7 +16,6 @@
 #include "image_framebuffer.h"
 #include "mbedtls/base64.h"
 #include "png.h"
-#include "secrets.h"
 
 #define APP_OPENAI_RESPONSES_URL "https://api.openai.com/v1/responses"
 #define APP_OPENAI_MODEL "gpt-5.4-nano"
@@ -42,6 +41,7 @@ typedef struct {
 } app_png_memory_writer_t;
 
 static const char *TAG = "app_api";
+static const char *s_openai_api_key = "";
 static const char *APP_PROMPT_WORDS[APP_PROMPT_WORD_COUNT] = {
     "square",
     "triangle",
@@ -49,9 +49,26 @@ static const char *APP_PROMPT_WORDS[APP_PROMPT_WORD_COUNT] = {
     "rectangle",
 };
 
+static esp_err_t app_http_post_json(const char *url,
+                                    const char *body,
+                                    char *out_response,
+                                    size_t out_response_len);
+
+static app_api_http_post_fn s_http_post_json = app_http_post_json;
+
+void app_api_set_openai_api_key(const char *api_key)
+{
+    s_openai_api_key = (api_key != NULL) ? api_key : "";
+}
+
+void app_api_set_http_post_for_test(app_api_http_post_fn http_post)
+{
+    s_http_post_json = (http_post != NULL) ? http_post : app_http_post_json;
+}
+
 static bool app_is_api_key_configured(void)
 {
-    return (OPENAI_API_KEY[0] != '\0') && (strcmp(OPENAI_API_KEY, "YOUR_OPENAI_API_KEY") != 0);
+    return (s_openai_api_key[0] != '\0') && (strcmp(s_openai_api_key, "YOUR_OPENAI_API_KEY") != 0);
 }
 
 static bool app_is_allowed_prompt_word(const char *word)
@@ -160,7 +177,7 @@ static esp_err_t app_http_post_json_once(const char *url,
     };
 
     char auth_header[160];
-    const int auth_written = snprintf(auth_header, sizeof(auth_header), "Bearer %s", OPENAI_API_KEY);
+    const int auth_written = snprintf(auth_header, sizeof(auth_header), "Bearer %s", s_openai_api_key);
     if (auth_written <= 0 || (size_t)auth_written >= sizeof(auth_header)) {
         return ESP_ERR_INVALID_SIZE;
     }
@@ -906,10 +923,10 @@ esp_err_t app_api_submit_drawing(const char *payload,
     }
 
     ESP_LOGI(TAG, "Sending drawing submit request via OpenAI Responses API");
-    err = app_http_post_json(APP_OPENAI_RESPONSES_URL,
-                             request_body,
-                             http_response,
-                             APP_HTTP_RESPONSE_BUFFER_SIZE);
+    err = s_http_post_json(APP_OPENAI_RESPONSES_URL,
+                           request_body,
+                           http_response,
+                           APP_HTTP_RESPONSE_BUFFER_SIZE);
     free(request_body);
     if (err != ESP_OK) {
         free(http_response);
@@ -954,10 +971,10 @@ esp_err_t app_api_fetch_and_publish_prompt(app_api_send_frame_fn send_frame,
         }
 
         char http_response[APP_HTTP_RESPONSE_BUFFER_SIZE];
-        const esp_err_t prompt_err = app_http_post_json(APP_OPENAI_RESPONSES_URL,
-                                                        request_body,
-                                                        http_response,
-                                                        sizeof(http_response));
+        const esp_err_t prompt_err = s_http_post_json(APP_OPENAI_RESPONSES_URL,
+                                                      request_body,
+                                                      http_response,
+                                                      sizeof(http_response));
         free(request_body);
         if (prompt_err == ESP_OK) {
             char content[APP_AI_CONTENT_BUFFER_SIZE];

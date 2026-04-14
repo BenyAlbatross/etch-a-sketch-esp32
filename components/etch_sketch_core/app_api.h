@@ -19,6 +19,13 @@ typedef struct {
 } app_ai_submit_result_t;
 
 typedef esp_err_t (*app_api_send_frame_fn)(const char *payload, size_t payload_len);
+typedef esp_err_t (*app_api_http_post_fn)(const char *url,
+                                          const char *body,
+                                          char *out_response,
+                                          size_t out_response_len);
+
+void app_api_set_openai_api_key(const char *api_key);
+void app_api_set_http_post_for_test(app_api_http_post_fn http_post);
 
 esp_err_t app_api_submit_drawing(const char *payload,
                                  size_t payload_len,

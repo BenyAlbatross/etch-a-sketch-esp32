@@ -6,7 +6,6 @@
 
 #include "mbedtls/base64.h"
 
-#define IMAGE_FRAMEBUFFER_BYTES ((IMAGE_FRAMEBUFFER_CANVAS_WIDTH * IMAGE_FRAMEBUFFER_CANVAS_HEIGHT + 7U) / 8U)
 #define IMAGE_FRAMEBUFFER_SOCKET_JSON_PREFIX "{\"type\":\"frame\",\"width\":128,\"height\":128,\"format\":\"1bpp-msb\",\"data\":\""
 #define IMAGE_FRAMEBUFFER_SOCKET_JSON_SUFFIX "\"}"
 #define IMAGE_FRAMEBUFFER_INPUT_PACKET_BUFFER_LEN 96
@@ -179,10 +178,12 @@ void image_framebuffer_apply_input(image_framebuffer_t *framebuffer, const image
 
     if (state->erase) {
         image_framebuffer_clear(framebuffer);
+        framebuffer->status.has_cursor = false;
+        framebuffer->status.pen_down = false;
     }
 
     if (state->pen_down) {
-        if (framebuffer->status.has_cursor) {
+        if (framebuffer->status.has_cursor && framebuffer->status.pen_down) {
             image_framebuffer_draw_line(framebuffer,
                                     framebuffer->status.cursor_x,
                                     framebuffer->status.cursor_y,
@@ -198,6 +199,31 @@ void image_framebuffer_apply_input(image_framebuffer_t *framebuffer, const image
     framebuffer->status.pen_down = state->pen_down;
     framebuffer->status.submit_pending = state->submit;
     framebuffer->status.has_cursor = true;
+}
+
+size_t image_framebuffer_build_base64_data(const image_framebuffer_t *framebuffer, char *out_base64, size_t out_base64_len)
+{
+    if (framebuffer == NULL || out_base64 == NULL || out_base64_len == 0U) {
+        return 0U;
+    }
+
+    const size_t base64_max = 4U * ((IMAGE_FRAMEBUFFER_BYTES + 2U) / 3U);
+    if (out_base64_len < base64_max + 1U) {
+        return 0U;
+    }
+
+    size_t base64_len = 0U;
+    const int ret = mbedtls_base64_encode((unsigned char *)out_base64,
+                                          out_base64_len,
+                                          &base64_len,
+                                          framebuffer->framebuffer,
+                                          IMAGE_FRAMEBUFFER_BYTES);
+    if (ret != 0) {
+        return 0U;
+    }
+
+    out_base64[base64_len] = '\0';
+    return base64_len;
 }
 
 const image_framebuffer_status_t *image_framebuffer_get_status(const image_framebuffer_t *framebuffer)

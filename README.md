@@ -24,7 +24,7 @@ canonical drawing state and connects three things together:
 - **Framebuffer (authoritative state, slow path).** A third task receives the
   parsed states from a dedicated queue, validates each packet,
   and applies it to a 128x128 1-bit-per-pixel framebuffer
-  (`main/image_framebuffer.c`). Strokes between consecutive pen-down samples
+  (`components/etch_sketch_core/image_framebuffer.c`). Strokes between consecutive pen-down samples
   are filled with Bresenham line rasterization so the rendered drawing stays
   continuous even when the encoder skips pixels.
 - **Submit pipeline.** When the MCXC sets `submit=1`, the firmware base64-
@@ -122,19 +122,78 @@ traceback, the most common causes on this board are:
 3. The board didn't enter download mode — hold `BOOT`, tap `RST`, release
    `BOOT`, then re-run `flash`.
 
+## VS Code / ESP-IDF workspace files
+
+The `.vscode/` folder is VS Code workspace configuration, not ESP-IDF firmware
+source. The ESP-IDF VS Code extension can generate it, but it commonly contains
+developer-specific values such as local serial ports, toolchain paths,
+`clangd.path`, and absolute build paths.
+
+Recommended team practice:
+
+- Do not treat `.vscode/` as portable project source unless the files have been
+  sanitized for the whole team.
+- Prefer ignoring `.vscode/` in Git for this project. If the folder is already
+  tracked, adding it to `.gitignore` is not enough; remove it from the index
+  with `git rm --cached -r .vscode` after the team agrees.
+- Regenerate the folder in VS Code from the Command Palette with
+  `ESP-IDF: Add VS Code Configuration Folder`.
+- Espressif documents this command here:
+  https://docs.espressif.com/projects/vscode-esp-idf-extension/en/latest/commands.html
+- Espressif documents VS Code workspace-folder settings here:
+  https://docs.espressif.com/projects/vscode-esp-idf-extension/en/latest/settings.html
+
+## Unit tests
+
+Unity tests live with the testable component, and the `test/` directory is a
+separate ESP-IDF unit-test app.
+
+```sh
+cd etch-a-sketch-esp32/test
+idf.py -DIDF_TARGET=esp32s2 build
+idf.py -p /dev/tty.usbserial-XXXX flash monitor
+```
+
+When the Unity app is idle, press Enter in the serial monitor to print the test
+menu. Type `*` to run all tests, `[image_framebuffer]` to run framebuffer tests,
+or `[app_api]` to run API helper tests.
+
+`pytest_unittest.py` is optional automation around the same Unity test app:
+
+```sh
+cd etch-a-sketch-esp32/test
+pytest --target esp32s2 --build-dir /path/to/test/build
+```
+
 ## Project layout
 
 ```
 etch-a-sketch-esp32/
 ├── CMakeLists.txt
 ├── sdkconfig                  ESP-IDF build config (target = esp32s2)
+├── components/
+│   └── etch_sketch_core/
+│       ├── CMakeLists.txt
+│       ├── app_api.c
+│       ├── app_api.h
+│       ├── image_framebuffer.c
+│       ├── image_framebuffer.h
+│       ├── idf_component.yml
+│       └── test/
+│           ├── CMakeLists.txt
+│           └── test_image_framebuffer.c
 ├── main/
 │   ├── CMakeLists.txt
-│   ├── main.c                 Wi-Fi, UART task, HTTP server, HTTP client, WS
-│   ├── image_framebuffer.c    1bpp framebuffer, packet parser, line raster
-│   ├── image_framebuffer.h
-│   └── secrets.h              Wi-Fi creds + API base/token (gitignored)
-├── WIKI.md                    Iteration notes / design log
+│   ├── main.c                 Wi-Fi, UART tasks, HTTP server, WS, app orchestration
+│   └── secrets.h              Wi-Fi creds + OpenAI API key (gitignored)
+├── test/                      ESP-IDF Unity test-app project
+│   ├── CMakeLists.txt
+│   ├── sdkconfig.defaults
+│   ├── pytest_unittest.py
+│   └── main/
+│       ├── CMakeLists.txt
+│       └── test_app_main.c
+├── WIKI-ESP32.md              Iteration notes / design log
 └── README.md                  (this file)
 ```
 

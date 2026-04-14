@@ -1,3 +1,4 @@
 dependencies:
   idf: ">=5.0"
   espressif/cjson: "*"
+  espressif/libpng: "^1.6.56"

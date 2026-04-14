@@ -10,6 +10,8 @@ extern "C" {
 
 #define IMAGE_FRAMEBUFFER_CANVAS_WIDTH 128
 #define IMAGE_FRAMEBUFFER_CANVAS_HEIGHT 128
+#define IMAGE_FRAMEBUFFER_BYTES ((IMAGE_FRAMEBUFFER_CANVAS_WIDTH * IMAGE_FRAMEBUFFER_CANVAS_HEIGHT + 7U) / 8U)
+#define IMAGE_FRAMEBUFFER_BASE64_BUFFER_SIZE (4U * ((IMAGE_FRAMEBUFFER_BYTES + 2U) / 3U) + 1U)
 
 typedef struct {
     uint16_t x;
@@ -45,6 +47,7 @@ const image_framebuffer_status_t *image_framebuffer_get_status(const image_frame
  * Returns the number of bytes written (excluding null terminator), or 0 on failure.
  */
 size_t image_framebuffer_build_socket_payload(const image_framebuffer_t *framebuffer, char *out_json, size_t out_json_len);
+size_t image_framebuffer_build_base64_data(const image_framebuffer_t *framebuffer, char *out_base64, size_t out_base64_len);
 
 #ifdef __cplusplus
 }
