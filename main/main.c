@@ -597,6 +597,9 @@ static bool app_ws_handle_text_command(const char *payload, int target_fd)
         if (strcmp(type->valuestring, "resync") == 0) {
             app_enqueue_snapshot_request_event(target_fd);
             handled = true;
+        } else if (strcmp(type->valuestring, "heartbeat") == 0) {
+            static const char heartbeat_ack[] = "{\"type\":\"heartbeat_ack\"}";
+            handled = app_enqueue_viewer_payload(target_fd, heartbeat_ack, strlen(heartbeat_ack));
         } else if (strcmp(type->valuestring, "prompt_request") == 0) {
             app_enqueue_prompt_request_event();
             handled = true;
