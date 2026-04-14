@@ -25,8 +25,9 @@
 #define APP_HTTP_PERFORM_MAX_ATTEMPTS 3
 #define APP_HTTP_ALLOW_INSECURE_TEST_FALLBACK 1
 #define APP_PNG_DATA_URL_PREFIX "data:image/png;base64,"
-#define APP_PROMPT_WORD_COUNT 4U
+#define APP_PROMPT_WORD_COUNT 8U
 #define APP_SUBMIT_CONFIDENCE_PASS_THRESHOLD 6
+#define APP_API_LOCAL_DEBUG_MODE 1
 
 typedef struct {
     char *buffer;
@@ -42,11 +43,17 @@ typedef struct {
 
 static const char *TAG = "app_api";
 static const char *s_openai_api_key = "";
+static bool s_local_debug_mode = (APP_API_LOCAL_DEBUG_MODE != 0);
+static size_t s_prompt_word_index;
 static const char *APP_PROMPT_WORDS[APP_PROMPT_WORD_COUNT] = {
     "square",
     "triangle",
     "circle",
     "rectangle",
+    "house",
+    "tree",
+    "fish",
+    "star",
 };
 
 static esp_err_t app_http_post_json(const char *url,
@@ -64,6 +71,12 @@ void app_api_set_openai_api_key(const char *api_key)
 void app_api_set_http_post_for_test(app_api_http_post_fn http_post)
 {
     s_http_post_json = (http_post != NULL) ? http_post : app_http_post_json;
+}
+
+void app_api_set_local_debug_mode_for_test(bool enabled)
+{
+    s_local_debug_mode = enabled;
+    s_prompt_word_index = 0U;
 }
 
 static bool app_is_api_key_configured(void)
@@ -101,6 +114,18 @@ static void app_set_submit_result(app_ai_submit_result_t *out_result,
     out_result->guess[sizeof(out_result->guess) - 1U] = '\0';
     out_result->confidence = confidence;
     out_result->correct = correct;
+}
+
+static void app_select_next_local_prompt_word(char *out_word, size_t out_word_len)
+{
+    if (out_word == NULL || out_word_len == 0U) {
+        return;
+    }
+
+    const char *word = APP_PROMPT_WORDS[s_prompt_word_index];
+    s_prompt_word_index = (s_prompt_word_index + 1U) % APP_PROMPT_WORD_COUNT;
+    strncpy(out_word, word, out_word_len - 1U);
+    out_word[out_word_len - 1U] = '\0';
 }
 
 static esp_err_t app_http_event_handler(esp_http_client_event_t *evt)
@@ -892,9 +917,21 @@ esp_err_t app_api_submit_drawing(const char *payload,
         return ESP_ERR_INVALID_ARG;
     }
 
-    (void)submit_stub_success_flag;
     *out_submit_success = false;
     app_set_submit_result(out_result, "unknown", 1, false);
+
+    if (s_local_debug_mode) {
+        const bool correct = submit_stub_success_flag;
+        const char *guess = (active_prompt_word[0] != '\0') ? active_prompt_word : "local-debug";
+        app_set_submit_result(out_result, guess, correct ? 10 : 1, correct);
+        *out_submit_success = true;
+        ESP_LOGI(TAG,
+                 "Local debug submit result: guess='%s', confidence=%d, correct=%u",
+                 out_result->guess,
+                 out_result->confidence,
+                 out_result->correct ? 1U : 0U);
+        return ESP_OK;
+    }
 
     if (!app_is_api_key_configured()) {
         ESP_LOGW(TAG, "OpenAI API key not configured, unable to submit drawing");
@@ -962,7 +999,10 @@ esp_err_t app_api_fetch_and_publish_prompt(app_api_send_frame_fn send_frame,
         return ESP_ERR_INVALID_ARG;
     }
 
-    if (!app_is_api_key_configured()) {
+    if (s_local_debug_mode) {
+        app_select_next_local_prompt_word(io_active_prompt_word, io_active_prompt_word_len);
+        ESP_LOGI(TAG, "Using local prompt word list");
+    } else if (!app_is_api_key_configured()) {
         ESP_LOGW(TAG, "OPENAI_API_KEY is not configured; using default prompt '%s'", io_active_prompt_word);
     } else {
         char *request_body = app_build_prompt_request_body();

@@ -43,10 +43,12 @@
 #define APP_MCU_CONTROL_PACKET_BUFFER_SIZE 48
 #define APP_MCU_RESULT_COMMAND "RESULT"
 #define APP_MCU_PROMPT_READY_COMMAND "PROMPT"
+#define APP_MCU_ACK_COMMAND "ACK"
 #define APP_VIEWER_PAYLOAD_BUFFER_SIZE (SOCKET_PAYLOAD_BUFFER_SIZE + 768U)
 #define APP_VIEWER_DELTA_BUFFER_SIZE 1024U
 #define APP_VIEWER_TARGET_BROADCAST (-1)
 #define APP_VIEWER_DELTA_PERIOD_MS 16U
+#define APP_PROMPT_READY_RETRY_MS 250U
 
 enum {
     APP_WS_MAX_OPEN_SOCKETS = 4,
@@ -209,14 +211,15 @@ static bool s_submit_stub_success_flag = true;
 
 static void app_enqueue_snapshot_request_event(int target_fd);
 static void app_process_packet_line_fast_path(const char *packet_line);
-static void app_enqueue_submit_event(void);
-static void app_enqueue_prompt_request_event(void);
+static bool app_enqueue_submit_event(void);
+static bool app_enqueue_prompt_request_event(void);
 
 static char s_active_prompt_word[APP_API_PROMPT_WORD_BUFFER_SIZE] = "square";
 static bool s_has_prompt;
 static app_phase_t s_app_phase = APP_PHASE_WAITING_FOR_PROMPT;
 static app_ai_submit_result_t s_last_result;
 static bool s_has_result;
+static bool s_prompt_request_in_flight;
 
 static esp_err_t app_send_mcu_command(const char *command, int value)
 {
@@ -246,6 +249,11 @@ static esp_err_t app_send_mcu_submit_result(bool submit_success)
 static esp_err_t app_send_mcu_prompt_ready(void)
 {
     return app_send_mcu_command(APP_MCU_PROMPT_READY_COMMAND, 1);
+}
+
+static esp_err_t app_send_mcu_ack(void)
+{
+    return app_send_mcu_command(APP_MCU_ACK_COMMAND, 0);
 }
 
 static const char *app_phase_to_json(app_phase_t phase)
@@ -914,6 +922,10 @@ static esp_err_t app_socket_send_frame_to_target(const char *payload, size_t pay
         return ESP_ERR_INVALID_ARG;
     }
 
+#if !CONFIG_HTTPD_WS_SUPPORT
+    (void)target_fd;
+    return ESP_OK;
+#else
     if (s_ws_server == NULL) {
         const esp_err_t start_err = app_ws_server_start();
         if (start_err != ESP_OK) {
@@ -921,11 +933,6 @@ static esp_err_t app_socket_send_frame_to_target(const char *payload, size_t pay
         }
     }
 
-#if !CONFIG_HTTPD_WS_SUPPORT
-    (void)payload;
-    (void)payload_len;
-    return ESP_ERR_NOT_SUPPORTED;
-#else
     size_t fds_count = APP_WS_MAX_CLIENT_FDS;
     int client_fds[APP_WS_MAX_CLIENT_FDS] = {0};
     esp_err_t err = ESP_OK;
@@ -1228,22 +1235,22 @@ static void app_enqueue_framebuffer_state(const image_input_state_t *state)
     app_enqueue_framebuffer_msg(&msg, pdMS_TO_TICKS(APP_RTOS_CONFIG.framebuffer_queue_send_timeout_ms));
 }
 
-static void app_enqueue_submit_event(void)
+static bool app_enqueue_submit_event(void)
 {
     framebuffer_state_msg_t msg = {
         .type = FRAMEBUFFER_EVENT_SUBMIT,
         .target_fd = APP_VIEWER_TARGET_BROADCAST,
     };
-    app_enqueue_framebuffer_msg(&msg, pdMS_TO_TICKS(20U));
+    return app_enqueue_framebuffer_msg(&msg, pdMS_TO_TICKS(20U));
 }
 
-static void app_enqueue_prompt_request_event(void)
+static bool app_enqueue_prompt_request_event(void)
 {
     framebuffer_state_msg_t msg = {
         .type = FRAMEBUFFER_EVENT_PROMPT_REQUEST,
         .target_fd = APP_VIEWER_TARGET_BROADCAST,
     };
-    app_enqueue_framebuffer_msg(&msg, pdMS_TO_TICKS(20U));
+    return app_enqueue_framebuffer_msg(&msg, pdMS_TO_TICKS(20U));
 }
 
 static void app_enqueue_snapshot_request_event(int target_fd)
@@ -1289,21 +1296,22 @@ static void app_process_packet_line_fast_path(const char *packet_line)
     app_log_uart_input_if_changed(&state);
 
     const bool submit_rising_edge = state.submit && !s_submit_level_high;
-    s_submit_level_high = state.submit;
-
     const bool prompt_request_rising_edge = state.prompt_request && !s_prompt_request_level_high;
-    s_prompt_request_level_high = state.prompt_request;
 
     // Authoritative path: framebuffer state owns what the viewer can restore.
     app_enqueue_framebuffer_state(&state);
 
     // Command path: enqueue explicit submit event on rising edge only.
     if (submit_rising_edge) {
-        app_enqueue_submit_event();
+        s_submit_level_high = app_enqueue_submit_event();
+    } else if (!state.submit) {
+        s_submit_level_high = false;
     }
 
     if (prompt_request_rising_edge) {
-        app_enqueue_prompt_request_event();
+        s_prompt_request_level_high = app_enqueue_prompt_request_event();
+    } else if (!state.prompt_request) {
+        s_prompt_request_level_high = false;
     }
 }
 
@@ -1347,6 +1355,32 @@ static void app_append_viewer_delta_for_state(app_viewer_delta_buffer_t *delta,
     app_viewer_delta_append_cursor(delta, state);
 }
 
+static void app_maybe_resend_prompt_ready(const image_input_state_t *state)
+{
+    static TickType_t last_prompt_retry_tick;
+    static bool has_prompt_retry_tick;
+
+    if (state == NULL || !state->prompt_request ||
+        s_app_phase != APP_PHASE_DRAWING || !s_has_prompt) {
+        return;
+    }
+
+    const TickType_t now = xTaskGetTickCount();
+    if (has_prompt_retry_tick &&
+        (now - last_prompt_retry_tick) < pdMS_TO_TICKS(APP_PROMPT_READY_RETRY_MS)) {
+        return;
+    }
+
+    last_prompt_retry_tick = now;
+    has_prompt_retry_tick = true;
+    const esp_err_t notify_err = app_send_mcu_prompt_ready();
+    if (notify_err != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to resend PROMPT ready command to MCU: %s", esp_err_to_name(notify_err));
+    } else {
+        ESP_LOGI(TAG, "Resent PROMPT ready command to MCU");
+    }
+}
+
 static void app_process_authoritative_input(const image_input_state_t *state,
                                             app_viewer_delta_buffer_t *delta)
 {
@@ -1361,12 +1395,19 @@ static void app_process_authoritative_input(const image_input_state_t *state,
     image_framebuffer_status_t previous_status = s_framebuffer.status;
     app_process_framebuffer_state(state);
     app_append_viewer_delta_for_state(delta, &previous_status, state);
+    app_maybe_resend_prompt_ready(state);
+    if (state->erase) {
+        const esp_err_t ack_err = app_send_mcu_ack();
+        if (ack_err != ESP_OK) {
+            ESP_LOGW(TAG, "Failed to send ACK command to MCU: %s", esp_err_to_name(ack_err));
+        }
+    }
     if (delta != NULL && delta->len > ((sizeof(delta->json) * 3U) / 4U)) {
         app_viewer_delta_flush(delta);
     }
 }
 
-static void app_request_prompt_fetch(void)
+static bool app_request_prompt_fetch(void)
 {
     api_request_msg_t request = {
         .type = API_REQUEST_PROMPT,
@@ -1376,13 +1417,24 @@ static void app_request_prompt_fetch(void)
 
     if (!app_enqueue_api_request(&request)) {
         ESP_LOGW(TAG, "Prompt request queue full");
+        return false;
     }
+
+    s_prompt_request_in_flight = true;
+    return true;
 }
 
 static void app_start_new_prompt_request(void)
 {
     if (s_app_phase == APP_PHASE_RESULT) {
         image_framebuffer_init(&s_framebuffer);
+        s_prompt_request_in_flight = false;
+    } else if (s_app_phase == APP_PHASE_DRAWING && s_has_prompt) {
+        const esp_err_t notify_err = app_send_mcu_prompt_ready();
+        if (notify_err != ESP_OK) {
+            ESP_LOGW(TAG, "Failed to resend PROMPT ready command to MCU: %s", esp_err_to_name(notify_err));
+        }
+        return;
     } else if (s_app_phase != APP_PHASE_WAITING_FOR_PROMPT) {
         return;
     }
@@ -1391,7 +1443,9 @@ static void app_start_new_prompt_request(void)
     s_has_prompt = false;
     s_has_result = false;
     app_enqueue_snapshot(APP_VIEWER_TARGET_BROADCAST);
-    app_request_prompt_fetch();
+    if (!s_prompt_request_in_flight) {
+        app_request_prompt_fetch();
+    }
 }
 
 static void app_start_submit_request(void)
@@ -1477,6 +1531,7 @@ static void app_finish_prompt_request(const char *prompt_word)
     s_has_prompt = true;
     s_has_result = false;
     s_app_phase = APP_PHASE_DRAWING;
+    s_prompt_request_in_flight = false;
 
     app_enqueue_snapshot(APP_VIEWER_TARGET_BROADCAST);
     app_enqueue_legacy_prompt_payload(s_active_prompt_word);
@@ -1706,10 +1761,14 @@ void app_main(void)
         return;
     }
 
+#if CONFIG_HTTPD_WS_SUPPORT
     const esp_err_t ws_start_err = app_ws_server_start();
     if (ws_start_err != ESP_OK) {
         ESP_LOGW(TAG, "Continuing without active WebSocket server");
     }
+#else
+    ESP_LOGI(TAG, "WebSocket support disabled; viewer payloads are ignored locally");
+#endif
 
     const esp_err_t uart_init_err = app_uart_init();
     if (uart_init_err != ESP_OK) {

@@ -1,5 +1,6 @@
 #include "image_framebuffer.h"
 
+#include <ctype.h>
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
@@ -18,7 +19,15 @@ static bool image_framebuffer_parse_int_token(const char *token, int *out_value)
 
     char *end_ptr = NULL;
     const long parsed = strtol(token, &end_ptr, 10);
-    if (end_ptr == token || *end_ptr != '\0') {
+    if (end_ptr == token) {
+        return false;
+    }
+
+    while (*end_ptr != '\0' && isspace((unsigned char)*end_ptr)) {
+        end_ptr++;
+    }
+
+    if (*end_ptr != '\0') {
         return false;
     }
 

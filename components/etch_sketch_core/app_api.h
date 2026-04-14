@@ -26,6 +26,7 @@ typedef esp_err_t (*app_api_http_post_fn)(const char *url,
 
 void app_api_set_openai_api_key(const char *api_key);
 void app_api_set_http_post_for_test(app_api_http_post_fn http_post);
+void app_api_set_local_debug_mode_for_test(bool enabled);
 
 esp_err_t app_api_submit_drawing(const char *payload,
                                  size_t payload_len,
