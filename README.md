@@ -52,10 +52,10 @@ canonical drawing state and connects three things together:
 
 Current application task priorities are set in `main/main.c`:
 
-- `viewer_task` = 7
 - `state_dispatch_task` = 6
 - `uart_rx_task` = 5
-- `framebuffer_task` = 3
+- `framebuffer_task` = 4
+- `viewer_task` = 3
 - `api_task` = 3
 
 Rationale for the ordering:
@@ -63,11 +63,14 @@ Rationale for the ordering:
 - Queue stage 1 (`s_uart_packet_queue`): `state_dispatch_task` is the consumer
   and `uart_rx_task` is the producer, so consumer priority is higher to drain
   bursts quickly.
-- Viewer stage (`s_viewer_event_queue`): `viewer_task` is set highest so
-  WebSocket payloads drain quickly and draw-to-screen latency stays low.
-- `framebuffer_task` and `api_task` are kept lower in this tuning profile; use
-  UART pipeline counters (`fbDrops`, `fbDepth`, `viewerDrops`, `viewerDepth`)
-  to verify this balance remains healthy under sustained input.
+- Framebuffer stage (`s_framebuffer_state_queue`): `framebuffer_task` runs below
+  `uart_rx_task` and `state_dispatch_task`, but above viewer/API work, so the
+  authoritative drawing state continues to drain after the live path accepts a
+  parsed sample.
+- `viewer_task` and `api_task` share the lowest application priority in this
+  tuning profile. They are both fed by bounded queues, so use UART pipeline
+  counters (`fbDrops`, `fbDepth`, `viewerDrops`, `viewerDepth`) to verify this
+  balance remains healthy under sustained input.
 
 Reference:
 
